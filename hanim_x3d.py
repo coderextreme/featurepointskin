@@ -2,13 +2,15 @@
 """
 hanim_x3d.py
 
-Standalone HAnim (HAnimHumanoid / HAnimJoint / HAnimSegment / HAnimSite)
+Standalone HAnim (HAnimHumanoid / HAnimJoint / HAnimSegment / HAnimSite / HAnimDisplacer)
 support for the io_scene_x3d Blender extension.
 
 Design decisions baked into this module:
   1. Skin weighting is per-HAnimJoint -> one Blender vertex group per joint/bone.
   2. HAnimSite center/translation is auto-compensated for Blender's tail-relative Empty parenting.
   3. HAnimJoint.scaleOrientation is baked into the bone's rest-pose matrix on import.
+  4. HAnimSegment own-geometry walks Transform hierarchies, baking cumulative matrices.
+  5. HAnimDisplacer nodes import as Blender Shape Keys with coordinate displacements.
 """
 
 import json
@@ -28,6 +30,7 @@ JOINT_PROPS = ("ulimit", "llimit", "limitOrientation", "stiffness",
 SEGMENT_PROPS = ("mass", "centerOfMass", "momentsOfInertia",
                  "bboxCenter", "bboxSize")
 SITE_PROPS = ("bboxCenter", "bboxSize")
+DISPLACER_PROPS = ("weight", "coordIndex", "displacements", "bboxCenter", "bboxSize")
 
 
 def prop(name):
@@ -41,10 +44,11 @@ def prop(name):
 _FLOAT3_FIELDS = {"center", "translation", "scale", "bboxCenter", "bboxSize",
                   "centerOfMass", "stiffness"}
 _FLOAT4_FIELDS = {"rotation", "scaleOrientation", "limitOrientation"}
-_STRING_FIELDS = {"name", "version"}
-_FLOAT_FIELDS = {"mass"}
+_STRING_FIELDS = {"name", "version", "description"}
+_FLOAT_FIELDS = {"mass", "weight"}
 _INT_ARRAY_FIELDS = {"skinCoordIndex", "coordIndex", "index"}
-_FLOAT_ARRAY_FIELDS = {"skinCoordWeight", "momentsOfInertia", "ulimit", "llimit", "point"}
+_FLOAT_ARRAY_FIELDS = {"skinCoordWeight", "momentsOfInertia", "ulimit", "llimit",
+                       "point", "displacements", "key", "keyValue"}
 
 
 def get_field(node, field_name, default=None, ancestry=()):
@@ -108,6 +112,57 @@ def bake_scale_orientation(local_matrix, scale_orientation):
             @ baked_scale_block)
 
 
+def get_node_transform_matrix(node):
+    """Computes cumulative local 4x4 matrix of an X3D Transform node."""
+    cent = Vector(get_field(node, "center", (0.0, 0.0, 0.0)))
+    rot = get_field(node, "rotation", (0.0, 0.0, 1.0, 0.0))
+    sca = Vector(get_field(node, "scale", (1.0, 1.0, 1.0)))
+    scaori = get_field(node, "scaleOrientation", (0.0, 0.0, 1.0, 0.0))
+    tx = Vector(get_field(node, "translation", (0.0, 0.0, 0.0)))
+
+    cent_mat = Matrix.Translation(cent)
+    cent_imat = Matrix.Translation(-cent)
+
+    rot_axis = Vector(rot[:3])
+    rot_quat = (Quaternion(rot_axis.normalized(), rot[3])
+                if rot_axis.length > 1e-6 else Quaternion())
+    rot_mat = rot_quat.to_matrix().to_4x4()
+
+    sca_mat = Matrix.Diagonal((*sca, 1.0))
+
+    so_axis = Vector(scaori[:3])
+    so_quat = (Quaternion(so_axis.normalized(), scaori[3])
+               if so_axis.length > 1e-6 else Quaternion())
+    so_mat = so_quat.to_matrix().to_4x4()
+    so_imat = so_mat.inverted()
+
+    tx_mat = Matrix.Translation(tx)
+    return tx_mat @ cent_mat @ rot_mat @ so_mat @ sca_mat @ so_imat @ cent_imat
+
+
+def real_node(node):
+    getter = getattr(node, "getRealNode", None)
+    return getter() if getter is not None else node
+
+
+def unique_real_children(node, consumed_real_ids):
+    out = []
+    for child in get_children(node):
+        real = real_node(child)
+        if id(real) in consumed_real_ids:
+            continue
+        consumed_real_ids.add(id(real))
+        out.append(real)
+    return out
+
+
+def _consume_subtree(node, consumed_ids):
+    consumed_ids.add(id(node))
+    consumed_ids.add(id(real_node(node)))
+    for child in get_children(node):
+        _consume_subtree(child, consumed_ids)
+
+
 # ---------------------------------------------------------------------------
 # Import logic
 # ---------------------------------------------------------------------------
@@ -121,8 +176,15 @@ def import_humanoid(bpycollection, humanoid_node, ancestry, global_matrix, conte
     humanoid_local_matrix = read_rest_local_matrix_from(armature_obj)
     armature_obj.matrix_basis = ancestry_matrix @ humanoid_local_matrix
 
-    consumed_ids = {id(humanoid_node)}
+    consumed_ids = {id(humanoid_node), id(real_node(humanoid_node))}
     consumed_ids.update(id(n) for n in root_joints)
+    consumed_ids.update(id(real_node(n)) for n in root_joints)
+
+    # Set references on humanoid_node so DEF/USE can resolve directly
+    humanoid_node.blendObject = armature_obj
+    humanoid_node.blendData = armature_obj.data
+    real_node(humanoid_node).blendObject = armature_obj
+    real_node(humanoid_node).blendData = armature_obj.data
 
     body_mesh_obj = None
     skin_coord_node = humanoid_node.getChildBySpec('Coordinate')
@@ -210,6 +272,7 @@ def _import_body_recursive(context, node, armature_obj, joint_bone_name,
                            consumed_ids):
     for child in get_children(node):
         consumed_ids.add(id(child))
+        consumed_ids.add(id(real_node(child)))
         spec = child.getSpec()
 
         if spec == 'HAnimJoint':
@@ -224,18 +287,11 @@ def _import_body_recursive(context, node, armature_obj, joint_bone_name,
         elif spec == 'HAnimSegment':
             if body_mesh_obj is not None:
                 import_segment_metadata(child, joint_bone_name, body_mesh_obj)
+                import_displacers(body_mesh_obj, child)
             else:
                 import_segment(context, child, armature_obj, joint_bone_name,
                                collection, shared_mesh_data=None)
-                for shape in get_children(child):
-                    consumed_ids.add(id(shape))
-                    geometry = (shape.getChildBySpec('IndexedFaceSet') or
-                                shape.getChildBySpec('IndexedTriangleSet'))
-                    if geometry is not None:
-                        consumed_ids.add(id(geometry))
-                        coord = geometry.getChildBySpec('Coordinate')
-                        if coord is not None:
-                            consumed_ids.add(id(coord))
+            _consume_subtree(child, consumed_ids)
 
         elif spec == 'HAnimSite':
             import_site(context, child, armature_obj, joint_bone_name, collection)
@@ -257,22 +313,6 @@ def import_segment_metadata(segment_node, joint_bone_name, body_mesh_obj):
         segments = []
     segments.append(entry)
     body_mesh_obj[key] = json.dumps(segments)
-
-
-def real_node(node):
-    getter = getattr(node, "getRealNode", None)
-    return getter() if getter is not None else node
-
-
-def unique_real_children(node, consumed_real_ids):
-    out = []
-    for child in get_children(node):
-        real = real_node(child)
-        if id(real) in consumed_real_ids:
-            continue
-        consumed_real_ids.add(id(real))
-        out.append(real)
-    return out
 
 
 def import_humanoid_armature(context, humanoid_node, collection):
@@ -323,7 +363,8 @@ def import_humanoid_armature(context, humanoid_node, collection):
         root_joints = named_roots if named_roots else root_joints[:1]
 
     for root in root_joints:
-        _import_joint_recursive(armature_data, root, parent_bone_name=None,
+        _import_joint_recursive(armature_data, root, armature_obj=armature_obj,
+                                parent_bone_name=None,
                                 parent_matrix=Matrix.Identity(4),
                                 joint_bone_names=joint_bone_names,
                                 bone_custom_props=bone_custom_props,
@@ -373,12 +414,29 @@ def _leaf_tail_direction(bone, world_matrices):
     return Vector((0.0, length_ref, 0.0))
 
 
-def _import_joint_recursive(armature_data, joint_node, parent_bone_name,
-                            parent_matrix, joint_bone_names,
-                            bone_custom_props, world_matrices):
+def _import_joint_recursive(armature_data, joint_node, armature_obj=None,
+                            parent_bone_name=None, parent_matrix=None,
+                            joint_bone_names=None, bone_custom_props=None,
+                            world_matrices=None):
+    if parent_matrix is None:
+        parent_matrix = Matrix.Identity(4)
+    if joint_bone_names is None:
+        joint_bone_names = {}
+    if bone_custom_props is None:
+        bone_custom_props = {}
+    if world_matrices is None:
+        world_matrices = {}
+
     joint_name = get_field(joint_node, "name", "Joint")
     bone = armature_data.edit_bones.new(joint_name)
     joint_bone_names[joint_name] = bone.name
+
+    # Set blendObject and blendData so import_x3d can route to this joint's bone
+    if armature_obj is not None:
+        joint_node.blendObject = armature_obj
+        joint_node.blendData = bone.name
+        real_node(joint_node).blendObject = armature_obj
+        real_node(joint_node).blendData = bone.name
 
     center = Vector(get_field(joint_node, "center", (0, 0, 0)))
     rotation = get_field(joint_node, "rotation", (0, 0, 1, 0))
@@ -418,9 +476,25 @@ def _import_joint_recursive(armature_data, joint_node, parent_bone_name,
 
     for child in get_children(joint_node):
         if get_field(child, "node_type") == "HAnimJoint":
-            _import_joint_recursive(armature_data, child, bone.name,
-                                    world_matrix, joint_bone_names,
-                                    bone_custom_props, world_matrices)
+            _import_joint_recursive(armature_data, child, armature_obj=armature_obj,
+                                    parent_bone_name=bone.name,
+                                    parent_matrix=world_matrix,
+                                    joint_bone_names=joint_bone_names,
+                                    bone_custom_props=bone_custom_props,
+                                    world_matrices=world_matrices)
+
+
+def _collect_segment_shapes(node, current_matrix, shape_list):
+    """Walks Transform/Group wrappers within a segment collecting (Shape, cumulative_matrix)."""
+    for child in get_children(node):
+        spec = child.getSpec()
+        if spec == 'Transform':
+            tx_mat = get_node_transform_matrix(child)
+            _collect_segment_shapes(child, current_matrix @ tx_mat, shape_list)
+        elif spec == 'Shape':
+            shape_list.append((child, current_matrix))
+        elif spec in ('Group', 'StaticGroup'):
+            _collect_segment_shapes(child, current_matrix, shape_list)
 
 
 def import_segment(context, segment_node, armature_obj, joint_bone_name,
@@ -433,17 +507,27 @@ def import_segment(context, segment_node, armature_obj, joint_bone_name,
         mesh_obj.parent = armature_obj
     else:
         mesh_data = bpy.data.meshes.new(seg_name)
-        import_segment_own_geometry(mesh_data, segment_node)
+        primary_matrix = import_segment_own_geometry(mesh_data, segment_node)
         mesh_obj = bpy.data.objects.new(seg_name, mesh_data)
         mesh_obj.parent = armature_obj
-        mesh_obj.parent_type = 'BONE'
-        mesh_obj.parent_bone = joint_bone_name
+        if joint_bone_name and joint_bone_name in armature_obj.data.bones:
+            mesh_obj.parent_type = 'BONE'
+            mesh_obj.parent_bone = joint_bone_name
 
     collection.objects.link(mesh_obj)
+
+    # Register blendObject and blendData for DEF/USE and ROUTE resolution
+    segment_node.blendObject = mesh_obj
+    segment_node.blendData = mesh_obj.data
+    real_node(segment_node).blendObject = mesh_obj
+    real_node(segment_node).blendData = mesh_obj.data
 
     if uses_shared_skin:
         modifier = mesh_obj.modifiers.new(name="HAnimSkin", type='ARMATURE')
         modifier.object = armature_obj
+
+    # Import HAnimDisplacer children as Blender Shape Keys
+    import_displacers(mesh_obj, segment_node, primary_matrix if not uses_shared_skin else Matrix.Identity(4))
 
     for field_name in SEGMENT_PROPS:
         val = get_field(segment_node, field_name)
@@ -456,25 +540,36 @@ def import_segment(context, segment_node, armature_obj, joint_bone_name,
 
 
 def import_segment_own_geometry(mesh_data, segment_node):
+    """Imports segment geometry walking Transform wrappers and baking translations/rotations."""
     verts = []
     faces = []
     vertex_offset = 0
 
-    for shape in get_children(segment_node):
-        if get_field(shape, "node_type") != "Shape":
-            continue
+    shape_list = []
+    _collect_segment_shapes(segment_node, Matrix.Identity(4), shape_list)
+    primary_matrix = shape_list[0][1] if shape_list else Matrix.Identity(4)
+
+    from . import import_x3d as _import_x3d
+
+    for shape, matrix in shape_list:
         geometry = (shape.getChildBySpec('IndexedFaceSet') or
-                    shape.getChildBySpec('IndexedTriangleSet'))
+                    shape.getChildBySpec('IndexedTriangleSet') or
+                    shape.getChildBySpec('IndexedTriangleStripSet') or
+                    shape.getChildBySpec('IndexedTriangleFanSet') or
+                    shape.getChildBySpec('TriangleSet'))
         if geometry is None:
             continue
         geo_type = geometry.getSpec()
 
         coord_node = geometry.getChildBySpec('Coordinate')
         points = get_field(coord_node, "point", []) if coord_node else []
-        verts.extend(_grouped(points, 3))
+        raw_verts = _grouped(points, 3)
+        for pt in raw_verts:
+            v_transformed = matrix @ Vector(pt)
+            verts.append(v_transformed.to_tuple())
 
+        coord_index = get_field(geometry, "coordIndex", [])
         if geo_type == "IndexedFaceSet":
-            coord_index = get_field(geometry, "coordIndex", [])
             current_face = []
             for idx in coord_index:
                 if idx == -1:
@@ -487,14 +582,87 @@ def import_segment_own_geometry(mesh_data, segment_node):
                 faces.append(tuple(vertex_offset + i for i in current_face))
         else:
             index = get_field(geometry, "index", [])
-            for i in range(0, len(index) - 2, 3):
-                faces.append(tuple(vertex_offset + index[i + k] for k in range(3)))
+            if index:
+                for i in range(0, len(index) - 2, 3):
+                    faces.append(tuple(vertex_offset + index[i + k] for k in range(3)))
+            else:
+                for i in range(0, len(raw_verts) - 2, 3):
+                    faces.append((vertex_offset + i, vertex_offset + i + 1, vertex_offset + i + 2))
 
-        vertex_offset += len(points) // 3
+        # Attach materials and appearance if available
+        appr = shape.getChildBySpec('Appearance')
+        if appr is not None and hasattr(_import_x3d, "importShape_LoadAppearance"):
+            try:
+                bpymat, bpyima, _ = _import_x3d.importShape_LoadAppearance(
+                    shape.getDefName() or "SegmentShape", appr, (), shape, False
+                )
+                if bpymat and bpymat.name not in mesh_data.materials:
+                    mesh_data.materials.append(bpymat)
+            except Exception:
+                pass
+
+        vertex_offset += len(raw_verts)
 
     mesh_data.from_pydata(verts, [], faces)
     mesh_data.update()
-    return mesh_data
+    return primary_matrix
+
+
+def import_displacers(mesh_obj, segment_node, transform_matrix=Matrix.Identity(4)):
+    """Imports HAnimDisplacer child nodes as Blender Shape Keys."""
+    displacer_nodes = segment_node.getChildrenBySpec('HAnimDisplacer')
+    if not displacer_nodes:
+        return
+
+    num_verts = len(mesh_obj.data.vertices)
+    if num_verts == 0:
+        return
+
+    if not mesh_obj.data.shape_keys:
+        mesh_obj.shape_key_add(name="Basis", from_mix=False)
+
+    basis_key = mesh_obj.data.shape_keys.key_blocks[0]
+    rot_scale_mat = transform_matrix.to_3x3()
+
+    # Load or initialize displacer metadata dict on mesh_obj (ID datablock)
+    key = prop("displacers")
+    raw = mesh_obj.get(key, None)
+    try:
+        displacers_meta = json.loads(raw) if raw else {}
+    except Exception:
+        displacers_meta = {}
+
+    for disp_node in displacer_nodes:
+        disp_name = get_field(disp_node, "name", "Displacer")
+        disp_weight = get_field(disp_node, "weight", 0.0)
+        coord_indices = get_field(disp_node, "coordIndex", [])
+        displacements_raw = get_field(disp_node, "displacements", [])
+        displacements = _grouped(displacements_raw, 3)
+
+        shape_key = mesh_obj.shape_key_add(name=disp_name, from_mix=False)
+        shape_key.value = float(disp_weight)
+
+        for idx, delta in zip(coord_indices, displacements):
+            if 0 <= idx < num_verts:
+                d_vec = rot_scale_mat @ Vector(delta)
+                shape_key.data[idx].co = basis_key.data[idx].co + d_vec
+
+        # Store displacer attributes in the mesh_obj metadata dict
+        def_name = disp_node.getDefName()
+        displacers_meta[shape_key.name] = {
+            "name": disp_name,
+            "def_name": def_name,
+            "coordIndex": list(coord_indices),
+            "displacements": list(displacements_raw),
+        }
+
+        # Register blendObject and blendData so ROUTEs/Interpolators resolve directly
+        disp_node.blendObject = mesh_obj
+        disp_node.blendData = shape_key
+        real_node(disp_node).blendObject = mesh_obj
+        real_node(disp_node).blendData = shape_key
+
+    mesh_obj[key] = json.dumps(displacers_meta)
 
 
 def import_joint_skin_weights(joint_node, joint_bone_name, mesh_obj):
@@ -538,6 +706,11 @@ def import_site(context, site_node, armature_obj, joint_bone_name, collection):
     x3d_offset = Vector(center) + Vector(translation)
 
     empty.location = site_offset_import(bone, x3d_offset)
+
+    site_node.blendObject = empty
+    site_node.blendData = empty
+    real_node(site_node).blendObject = empty
+    real_node(site_node).blendData = empty
 
     for field_name in SITE_PROPS:
         val = get_field(site_node, field_name)
@@ -721,6 +894,50 @@ def export_segments_for_bone(armature_obj, bone, body_mesh_obj):
                 seg[field_name] = mesh_obj[key]
         ifs = export_mesh_as_indexed_face_set(mesh_obj.data)
         seg["children"] = [{"node_type": "Shape", "geometry": ifs}]
+
+        # Reconstruct / export HAnimDisplacer nodes from Shape Keys and stored metadata
+        displacers = []
+        if mesh_obj.data.shape_keys:
+            basis_key = mesh_obj.data.shape_keys.key_blocks[0]
+            raw_meta = mesh_obj.get(prop("displacers"), None)
+            try:
+                displacers_meta = json.loads(raw_meta) if raw_meta else {}
+            except Exception:
+                displacers_meta = {}
+
+            for key_block in mesh_obj.data.shape_keys.key_blocks[1:]:
+                meta = displacers_meta.get(key_block.name, {})
+                stored_ci = meta.get("coordIndex")
+                stored_disp = meta.get("displacements")
+                disp_name = meta.get("name", key_block.name)
+                def_name = meta.get("def_name")
+
+                if stored_ci is not None and stored_disp is not None:
+                    ci = list(stored_ci)
+                    disp = list(stored_disp)
+                else:
+                    ci = []
+                    disp = []
+                    for v_idx, (kb_pt, basis_pt) in enumerate(zip(key_block.data, basis_key.data)):
+                        delta = kb_pt.co - basis_pt.co
+                        if delta.length > 1e-5:
+                            ci.append(v_idx)
+                            disp.extend(delta[:])
+
+                displacer_dict = {
+                    "node_type": "HAnimDisplacer",
+                    "name": disp_name,
+                    "weight": key_block.value,
+                    "coordIndex": ci,
+                    "displacements": disp,
+                }
+                if def_name:
+                    displacer_dict["DEF"] = def_name
+                displacers.append(displacer_dict)
+
+        if displacers:
+            seg["displacers"] = displacers
+
         segments.append(seg)
 
     return segments

@@ -19,6 +19,11 @@ from itertools import chain
 from . import mfstring
 from . import hanim_x3d
 
+try:
+    from . import proto_x3d
+except Exception:
+    proto_x3d = None
+
 texture_cache = {}
 material_cache = {}
 font_variants_cache = {}
@@ -449,7 +454,6 @@ class vrmlNode(object):
         results.append((self, tuple(ancestry)))
         ancestry.append(self)
 
-        # Do not traverse the children of a USE/reference node
         if self.node_type == NODE_REFERENCE or self.reference is not None:
             return results
 
@@ -1042,7 +1046,7 @@ class x3dNode(vrmlNode):
         self.x3dNode = x3dNode
 
     def parse(self, IS_PROTO_DATA=False):
-        self.lineno = self.x3dNode.parse_position[0]
+        self.lineno = getattr(self.x3dNode, 'parse_position', (-1, -1))[0]
 
         define = self.x3dNode.getAttributeNode('DEF')
         if define:
@@ -1058,8 +1062,34 @@ class x3dNode(vrmlNode):
                     self.parent.children.remove(self)
                 return
 
-        for x3dChildNode in self.x3dNode.childNodes:
+        for x3dChildNode in list(self.x3dNode.childNodes):
             if x3dChildNode.nodeType in {x3dChildNode.TEXT_NODE, x3dChildNode.COMMENT_NODE, x3dChildNode.CDATA_SECTION_NODE}:
+                continue
+
+            # Capture XML <ROUTE ... /> statements directly into fields
+            if x3dChildNode.nodeType == x3dChildNode.ELEMENT_NODE and x3dChildNode.tagName.upper() == 'ROUTE':
+                fn = (x3dChildNode.getAttribute('fromNode') or x3dChildNode.getAttribute('fromnode') or '').strip()
+                ff = (x3dChildNode.getAttribute('fromField') or x3dChildNode.getAttribute('fromfield') or '').strip()
+                tn = (x3dChildNode.getAttribute('toNode') or x3dChildNode.getAttribute('tonode') or '').strip()
+                tf = (x3dChildNode.getAttribute('toField') or x3dChildNode.getAttribute('tofield') or '').strip()
+                if fn and tn:
+                    self.fields.append(['ROUTE', f"{fn}.{ff}", 'TO', f"{tn}.{tf}"])
+                continue
+
+            # Handle X3D ProtoDeclare
+            if x3dChildNode.nodeType == x3dChildNode.ELEMENT_NODE and x3dChildNode.tagName == 'ProtoDeclare':
+                if proto_x3d is not None and getattr(proto_x3d, 'manager', None) is not None:
+                    proto_x3d.manager.register_proto_declare(x3dChildNode)
+                elif proto_x3d is not None and hasattr(proto_x3d, 'register_proto_declare'):
+                    proto_x3d.register_proto_declare(x3dChildNode)
+                continue
+
+            # Handle X3D ProtoInstance
+            if x3dChildNode.nodeType == x3dChildNode.ELEMENT_NODE and x3dChildNode.tagName == 'ProtoInstance':
+                if proto_x3d is not None and getattr(proto_x3d, 'manager', None) is not None:
+                    proto_x3d.manager.expand_proto_instance(self, x3dChildNode, x3dNode, NODE_NORMAL)
+                elif proto_x3d is not None and hasattr(proto_x3d, 'expand_proto_instance'):
+                    proto_x3d.expand_proto_instance(self, x3dChildNode, x3dNode, NODE_NORMAL)
                 continue
 
             node_type = NODE_NORMAL
@@ -1671,6 +1701,21 @@ def importMesh_IndexedFaceSet(geom, ancestry):
         set_new_float_color_attribute(bpymesh, cco2)
         bpymesh.attributes.remove(bpymesh.attributes["temp_custom_colors"])
 
+    bpymesh.update()
+    return bpymesh
+
+
+def importMesh_Rectangle2D(geom, ancestry):
+    size = geom.getFieldAsFloatTuple('size', (2.0 * conversion_scale, 2.0 * conversion_scale), ancestry, conversion_scale)
+    dx = size[0] / 2.0
+    dy = size[1] / 2.0
+    bpymesh = bpy.data.meshes.new(name="Rectangle2D")
+    verts = [(-dx, -dy, 0.0), (dx, -dy, 0.0), (dx, dy, 0.0), (-dx, dy, 0.0)]
+    faces = [(0, 1, 2, 3)]
+    bpymesh.from_pydata(verts, [], faces)
+    bpymesh.validate()
+    d = bpymesh.uv_layers.new().data
+    d.foreach_set('uv', (0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0))
     bpymesh.update()
     return bpymesh
 
@@ -2688,6 +2733,7 @@ geometry_importers = {
     'TriangleStripSet': importMesh_TriangleStripSet,
     'TriangleFanSet': importMesh_TriangleFanSet,
     'LineSet': importMesh_LineSet,
+    'Rectangle2D': importMesh_Rectangle2D,
     'ElevationGrid': importMesh_ElevationGrid,
     'Extrusion': importMesh_Extrusion,
     'PointSet': importMesh_PointSet,
@@ -2927,134 +2973,535 @@ def download_audio(url, output_path=None):
     return web_resource_download_helper(url, '.wav', "downloaded_audio", output_path=output_path)
 
 
-def action_fcurve_ensure(action, data_path, array_index):
-    from . import blender_version_higher_44
-    for fcu in (action.layers[0].strips[0].channelbag(action.slots[0]).fcurves
-                if blender_version_higher_44 else action.fcurves):
-        if fcu.data_path == data_path and fcu.array_index == array_index:
-            return fcu
+# -----------------------------------------------------------------------------------
+# Animation / ROUTE resolution helpers
+# -----------------------------------------------------------------------------------
 
-    return (action.layers[0].strips[0].channelbag(action.slots[0]).fcurves
-            if blender_version_higher_44 else action.fcurves).new(data_path=data_path, index=array_index)
+def fcurve_set_loop(fcu, loop=True):
+    """Applies cyclic repetition to an F-Curve via a CYCLES modifier if loop is True."""
+    if not loop or fcu is None or not hasattr(fcu, "modifiers"):
+        return
+    if not any(mod.type == 'CYCLES' for mod in fcu.modifiers):
+        fcu.modifiers.new(type='CYCLES')
 
 
-def translatePositionInterpolator(node, action, ancestry):
-    key = node.getFieldAsArray('key', 0, ancestry)
-    keyValue = node.getFieldAsArray('keyValue', 3, ancestry)
-
-    loc_x = action_fcurve_ensure(action, "location", 0)
-    loc_y = action_fcurve_ensure(action, "location", 1)
-    loc_z = action_fcurve_ensure(action, "location", 2)
-
-    for i, time in enumerate(key):
+def action_fcurve_ensure(action, data_path, array_index, datablock=None):
+    """
+    Ensures an F-Curve exists on an Action for a given data_path and index.
+    Fully supports Blender 5.0+ / 5.2+ Slotted Actions as well as older versions.
+    """
+    # 1. Blender 4.4+ / 5.x official API when datablock is supplied
+    if hasattr(action, "fcurve_ensure_for_datablock") and datablock is not None:
         try:
-            x, y, z = keyValue[i]
-        except:
-            continue
-        loc_x.keyframe_points.insert(time, x)
-        loc_y.keyframe_points.insert(time, y)
-        loc_z.keyframe_points.insert(time, z)
+            fcu = action.fcurve_ensure_for_datablock(datablock, data_path, index=array_index)
+            if fcu:
+                return fcu
+        except Exception:
+            pass
+
+    # 2. Slotted actions (Blender 4.4 / 5.0 / 5.2+)
+    if hasattr(action, "slots"):
+        slot = None
+        if len(action.slots) > 0:
+            slot = action.slots[0]
+        else:
+            id_type = 'OBJECT'
+            name = "Slot"
+            if datablock is not None:
+                id_type = getattr(datablock, "id_type", 'OBJECT')
+                name = getattr(datablock, "name", "Slot")
+            elif "key_blocks" in data_path:
+                id_type = 'KEY'
+                name = "ShapeKeys"
+
+            for candidate in (id_type, 'OBJECT', 'KEY'):
+                try:
+                    slot = action.slots.new(id_type=candidate, name=name)
+                    break
+                except Exception:
+                    pass
+                try:
+                    slot = action.slots.new(candidate, name)
+                    break
+                except Exception:
+                    pass
+            if slot is None:
+                try:
+                    slot = action.slots.new(name=name)
+                except Exception:
+                    pass
+            if slot is None:
+                try:
+                    slot = action.slots.new()
+                except Exception:
+                    pass
+
+        if slot is not None:
+            # Try anim_utils helper
+            try:
+                from bpy_extras import anim_utils
+                channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+                if channelbag is not None:
+                    for fcu in channelbag.fcurves:
+                        if fcu.data_path == data_path and fcu.array_index == array_index:
+                            return fcu
+                    try:
+                        return channelbag.fcurves.new(data_path=data_path, index=array_index)
+                    except TypeError:
+                        return channelbag.fcurves.new(data_path, array_index)
+            except Exception:
+                pass
+
+            # Manual layer -> strip -> channelbag fallback
+            try:
+                if not hasattr(action, "layers") or len(action.layers) == 0:
+                    layer = action.layers.new("MainLayer")
+                else:
+                    layer = action.layers[0]
+
+                if len(layer.strips) == 0:
+                    try:
+                        strip = layer.strips.new(type='KEYFRAME')
+                    except Exception:
+                        strip = layer.strips.new()
+                else:
+                    strip = layer.strips[0]
+
+                channelbag = strip.channelbag(slot, ensure=True) if hasattr(strip, "channelbag") else None
+                if channelbag is not None:
+                    for fcu in channelbag.fcurves:
+                        if fcu.data_path == data_path and fcu.array_index == array_index:
+                            return fcu
+                    try:
+                        return channelbag.fcurves.new(data_path=data_path, index=array_index)
+                    except TypeError:
+                        return channelbag.fcurves.new(data_path, array_index)
+            except Exception:
+                pass
+
+    # 3. Legacy actions (Blender <= 4.3)
+    if hasattr(action, "fcurves"):
+        for fcu in action.fcurves:
+            if fcu.data_path == data_path and fcu.array_index == array_index:
+                return fcu
+        return action.fcurves.new(data_path=data_path, index=array_index)
+
+    raise AttributeError(
+        f"Unable to create or access F-Curve on Action '{action.name}' for data_path '{data_path}'"
+    )
+
+
+def _bind_action_to_datablock(datablock, action):
+    """
+    Safely binds an Action and its appropriate ActionSlot to an ID datablock.
+    Fully compatible with Blender 5.x Slotted Actions and legacy Blender versions.
+    """
+    if datablock is None or action is None:
+        return
+
+    if datablock.animation_data is None:
+        try:
+            datablock.animation_data_create()
+        except Exception:
+            return
+
+    anim_data = datablock.animation_data
+    if anim_data is None:
+        return
+
+    # 1. Assign the action to animation_data
+    try:
+        if anim_data.action != action:
+            anim_data.action = action
+    except Exception:
+        return
+
+    # 2. Assign action_slot (Blender 4.4+ / 5.x)
+    if hasattr(anim_data, "action_slot"):
+        try:
+            suitable = getattr(anim_data, "action_suitable_slots", None)
+            if suitable and len(suitable) > 0:
+                anim_data.action_slot = suitable[0]
+                return
+        except Exception:
+            pass
+
+        if hasattr(action, "slots") and len(action.slots) > 0:
+            target_id_type = getattr(datablock, "id_type", None)
+            candidate_slot = None
+
+            for slot in action.slots:
+                slot_id_type = getattr(slot, "target_id_type", None)
+                if target_id_type and slot_id_type == target_id_type:
+                    candidate_slot = slot
+                    break
+                elif slot_id_type in (None, 'UNSPECIFIED') and candidate_slot is None:
+                    candidate_slot = slot
+
+            if candidate_slot is None:
+                candidate_slot = action.slots[0]
+
+            try:
+                anim_data.action_slot = candidate_slot
+            except Exception:
+                pass
+
+
+def get_clock_timing(clock_node, default_clock=None, ancestry=()):
+    ref_clock = clock_node or default_clock
+    fps = bpy.context.scene.render.fps
+    if ref_clock is not None:
+        cycle_interval = ref_clock.getFieldAsFloat('cycleInterval', 1.0, ancestry)
+        start_time = ref_clock.getFieldAsFloat('startTime', 0.0, ancestry)
+        loop = ref_clock.getFieldAsBool('loop', False, ancestry)
+    else:
+        cycle_interval = 1.0
+        start_time = 0.0
+        loop = False
+
+    duration = cycle_interval if cycle_interval > 0 else 1.0
+    start_frame = 1.0 + start_time * fps
+    return duration, start_frame, fps, loop
+
+
+def translatePositionInterpolator(node, action, ancestry, target_node=None, target_field="", clock_node=None, default_clock=None):
+    key = node.getFieldAsArray('key', 0, ancestry)
+    key_value = node.getFieldAsArray('keyValue', 3, ancestry)
+    if not key or not key_value:
+        return
+
+    duration, start_frame, fps, loop = get_clock_timing(clock_node, default_clock, ancestry)
+    real_target = target_node.getRealNode() if (target_node and hasattr(target_node, 'getRealNode')) else target_node
+
+    # 1. Target is HAnimJoint (PoseBone)
+    if target_node is not None and target_node.getSpec() == 'HAnimJoint':
+        bone_name = getattr(target_node, 'blendData', None) or getattr(real_target, 'blendData', None)
+        if not bone_name or not isinstance(bone_name, str):
+            bone_name = target_node.getFieldAsString('name', 'Joint', ancestry)
+
+        armature_obj = getattr(target_node, 'blendObject', None) or getattr(real_target, 'blendObject', None)
+        rest_tx = Vector(target_node.getFieldAsFloatTuple('translation', (0.0, 0.0, 0.0), ancestry))
+
+        loc_x = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].location', 0, datablock=armature_obj)
+        loc_y = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].location', 1, datablock=armature_obj)
+        loc_z = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].location', 2, datablock=armature_obj)
+
+        for i, frac in enumerate(key):
+            if i >= len(key_value):
+                break
+            x, y, z = key_value[i]
+            frame = start_frame + frac * duration * fps
+            loc_x.keyframe_points.insert(frame, x - rest_tx.x)
+            loc_y.keyframe_points.insert(frame, y - rest_tx.y)
+            loc_z.keyframe_points.insert(frame, z - rest_tx.z)
+
+        for fcu in (loc_x, loc_y, loc_z):
+            for kf in fcu.keyframe_points:
+                kf.interpolation = 'LINEAR'
+            fcurve_set_loop(fcu, loop)
+        return
+
+    # 2. General Object location
+    obj = (getattr(target_node, 'blendObject', None) or getattr(real_target, 'blendObject', None)) if target_node else None
+    loc_x = action_fcurve_ensure(action, "location", 0, datablock=obj)
+    loc_y = action_fcurve_ensure(action, "location", 1, datablock=obj)
+    loc_z = action_fcurve_ensure(action, "location", 2, datablock=obj)
+
+    for i, frac in enumerate(key):
+        if i >= len(key_value):
+            break
+        x, y, z = key_value[i]
+        frame = start_frame + frac * duration * fps
+        loc_x.keyframe_points.insert(frame, x)
+        loc_y.keyframe_points.insert(frame, y)
+        loc_z.keyframe_points.insert(frame, z)
 
     for fcu in (loc_x, loc_y, loc_z):
         for kf in fcu.keyframe_points:
             kf.interpolation = 'LINEAR'
+        fcurve_set_loop(fcu, loop)
 
 
-def translateOrientationInterpolator(node, action, ancestry):
+def translateOrientationInterpolator(node, action, ancestry, target_node=None, target_field="", clock_node=None, default_clock=None):
     key = node.getFieldAsArray('key', 0, ancestry)
-    keyValue = node.getFieldAsArray('keyValue', 4, ancestry)
+    key_value = node.getFieldAsArray('keyValue', 4, ancestry)
+    if not key or not key_value:
+        return
 
-    rot_x = action_fcurve_ensure(action, "rotation_euler", 0)
-    rot_y = action_fcurve_ensure(action, "rotation_euler", 1)
-    rot_z = action_fcurve_ensure(action, "rotation_euler", 2)
+    duration, start_frame, fps, loop = get_clock_timing(clock_node, default_clock, ancestry)
+    real_target = target_node.getRealNode() if (target_node and hasattr(target_node, 'getRealNode')) else target_node
 
-    for i, time in enumerate(key):
-        try:
-            x, y, z, w = keyValue[i]
-        except:
-            continue
-        mtx = translateRotation((x, y, z, w))
-        eul = mtx.to_euler()
-        rot_x.keyframe_points.insert(time, eul.x)
-        rot_y.keyframe_points.insert(time, eul.y)
-        rot_z.keyframe_points.insert(time, eul.z)
+    # 1. Target is HAnimJoint (PoseBone rotation_quaternion)
+    if target_node is not None and target_node.getSpec() == 'HAnimJoint':
+        bone_name = getattr(target_node, 'blendData', None) or getattr(real_target, 'blendData', None)
+        if not bone_name or not isinstance(bone_name, str):
+            bone_name = target_node.getFieldAsString('name', 'Joint', ancestry)
 
-    for fcu in (rot_x, rot_y, rot_z):
+        armature_obj = getattr(target_node, 'blendObject', None) or getattr(real_target, 'blendObject', None)
+        if armature_obj and bone_name in armature_obj.pose.bones:
+            armature_obj.pose.bones[bone_name].rotation_mode = 'QUATERNION'
+
+        rest_rot = target_node.getFieldAsFloatTuple('rotation', (0.0, 0.0, 1.0, 0.0), ancestry)
+        rest_axis = Vector(rest_rot[:3])
+        rest_quat = (Quaternion(rest_axis.normalized(), rest_rot[3])
+                     if rest_axis.length > 1e-6 else Quaternion())
+
+        rot_w = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].rotation_quaternion', 0, datablock=armature_obj)
+        rot_x = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].rotation_quaternion', 1, datablock=armature_obj)
+        rot_y = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].rotation_quaternion', 2, datablock=armature_obj)
+        rot_z = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].rotation_quaternion', 3, datablock=armature_obj)
+
+        for i, frac in enumerate(key):
+            if i >= len(key_value):
+                break
+            ax, ay, az, angle = key_value[i]
+            axis = Vector((ax, ay, az))
+            quat = Quaternion(axis.normalized(), angle) if axis.length > 1e-6 else Quaternion()
+            delta_quat = quat @ rest_quat.inverted()
+            frame = start_frame + frac * duration * fps
+            rot_w.keyframe_points.insert(frame, delta_quat.w)
+            rot_x.keyframe_points.insert(frame, delta_quat.x)
+            rot_y.keyframe_points.insert(frame, delta_quat.y)
+            rot_z.keyframe_points.insert(frame, delta_quat.z)
+
+        for fcu in (rot_w, rot_x, rot_y, rot_z):
+            for kf in fcu.keyframe_points:
+                kf.interpolation = 'LINEAR'
+            fcurve_set_loop(fcu, loop)
+        return
+
+    # 2. General Object rotation
+    obj = (getattr(target_node, 'blendObject', None) or getattr(real_target, 'blendObject', None)) if target_node else None
+    if obj and obj.rotation_mode == 'QUATERNION':
+        rot_w = action_fcurve_ensure(action, "rotation_quaternion", 0, datablock=obj)
+        rot_x = action_fcurve_ensure(action, "rotation_quaternion", 1, datablock=obj)
+        rot_y = action_fcurve_ensure(action, "rotation_quaternion", 2, datablock=obj)
+        rot_z = action_fcurve_ensure(action, "rotation_quaternion", 3, datablock=obj)
+
+        for i, frac in enumerate(key):
+            if i >= len(key_value):
+                break
+            ax, ay, az, angle = key_value[i]
+            axis = Vector((ax, ay, az))
+            quat = Quaternion(axis.normalized(), angle) if axis.length > 1e-6 else Quaternion()
+            frame = start_frame + frac * duration * fps
+            rot_w.keyframe_points.insert(frame, quat.w)
+            rot_x.keyframe_points.insert(frame, quat.x)
+            rot_y.keyframe_points.insert(frame, quat.y)
+            rot_z.keyframe_points.insert(frame, quat.z)
+
+        for fcu in (rot_w, rot_x, rot_y, rot_z):
+            for kf in fcu.keyframe_points:
+                kf.interpolation = 'LINEAR'
+            fcurve_set_loop(fcu, loop)
+    else:
+        rot_x = action_fcurve_ensure(action, "rotation_euler", 0, datablock=obj)
+        rot_y = action_fcurve_ensure(action, "rotation_euler", 1, datablock=obj)
+        rot_z = action_fcurve_ensure(action, "rotation_euler", 2, datablock=obj)
+
+        for i, frac in enumerate(key):
+            if i >= len(key_value):
+                break
+            mtx = translateRotation(key_value[i])
+            eul = mtx.to_euler()
+            frame = start_frame + frac * duration * fps
+            rot_x.keyframe_points.insert(frame, eul.x)
+            rot_y.keyframe_points.insert(frame, eul.y)
+            rot_z.keyframe_points.insert(frame, eul.z)
+
+        for fcu in (rot_x, rot_y, rot_z):
+            for kf in fcu.keyframe_points:
+                kf.interpolation = 'LINEAR'
+            fcurve_set_loop(fcu, loop)
+
+
+def translateScalarInterpolator(node, action, ancestry, target_node=None, target_field="", clock_node=None, default_clock=None):
+    key = node.getFieldAsArray('key', 0, ancestry)
+    key_value = node.getFieldAsArray('keyValue', 0, ancestry)
+    if not key or not key_value:
+        return
+
+    duration, start_frame, fps, loop = get_clock_timing(clock_node, default_clock, ancestry)
+    real_target = target_node.getRealNode() if (target_node and hasattr(target_node, 'getRealNode')) else target_node
+
+    # 1. Target is HAnimDisplacer (Shape Key value)
+    if target_node is not None and (target_node.getSpec() == 'HAnimDisplacer' or target_field in {'weight', 'set_weight'}):
+        mesh_obj = getattr(target_node, 'blendObject', None) or getattr(real_target, 'blendObject', None)
+        shape_keys = mesh_obj.data.shape_keys if (mesh_obj and mesh_obj.data) else None
+        shape_key = getattr(target_node, 'blendData', None) or getattr(real_target, 'blendData', None)
+
+        key_name = shape_key.name if (shape_key and hasattr(shape_key, 'name')) else target_node.getFieldAsString('name', '', ancestry)
+        if not key_name:
+            key_name = target_node.getDefName() or (real_target.getDefName() if real_target else None) or "Displacer"
+
+        data_path = f'key_blocks["{key_name}"].value'
+        fcu = action_fcurve_ensure(action, data_path, 0, datablock=shape_keys)
+        for i, frac in enumerate(key):
+            if i >= len(key_value):
+                break
+            frame = start_frame + frac * duration * fps
+            fcu.keyframe_points.insert(frame, key_value[i])
         for kf in fcu.keyframe_points:
             kf.interpolation = 'LINEAR'
+        fcurve_set_loop(fcu, loop)
+        return
 
-
-def translateScalarInterpolator(node, action, ancestry):
-    key = node.getFieldAsArray('key', 0, ancestry)
-    keyValue = node.getFieldAsArray('keyValue', 4, ancestry)
-
-    sca_x = action_fcurve_ensure(action, "scale", 0)
-    sca_y = action_fcurve_ensure(action, "scale", 1)
-    sca_z = action_fcurve_ensure(action, "scale", 2)
-
-    for i, time in enumerate(key):
-        try:
-            x, y, z = keyValue[i]
-        except:
-            continue
-        sca_x.keyframe_points.new(time, x)
-        sca_y.keyframe_points.new(time, y)
-        sca_z.keyframe_points.new(time, z)
+    # 2. Target is scale or uniform scale
+    if target_field in {'scale', 'set_scale'}:
+        obj = (getattr(target_node, 'blendObject', None) or getattr(real_target, 'blendObject', None)) if target_node else None
+        sca_x = action_fcurve_ensure(action, "scale", 0, datablock=obj)
+        sca_y = action_fcurve_ensure(action, "scale", 1, datablock=obj)
+        sca_z = action_fcurve_ensure(action, "scale", 2, datablock=obj)
+        for i, frac in enumerate(key):
+            if i >= len(key_value):
+                break
+            val = key_value[i]
+            frame = start_frame + frac * duration * fps
+            sca_x.keyframe_points.insert(frame, val)
+            sca_y.keyframe_points.insert(frame, val)
+            sca_z.keyframe_points.insert(frame, val)
+        for fcu in (sca_x, sca_y, sca_z):
+            for kf in fcu.keyframe_points:
+                kf.interpolation = 'LINEAR'
+            fcurve_set_loop(fcu, loop)
 
 
 def translateTimeSensor(node, action, ancestry):
     return
 
 
-def importRoute(node, ancestry):
-    if not hasattr(node, 'fields'):
-        return
-
-    routeIpoDict = node.getRouteIpoDict()
+def process_all_routes(all_nodes, root_node, bpycollection):
+    routeIpoDict = root_node.getRouteIpoDict()
+    defDict = root_node.getDefDict()
 
     def getIpo(act_id):
         try:
             action = routeIpoDict[act_id]
-        except:
-            action = routeIpoDict[act_id] = bpy.data.actions.new('web3d_ipo')
+        except KeyError:
+            action = routeIpoDict[act_id] = bpy.data.actions.new(act_id)
+            action.use_fake_user = True
         return action
 
-    defDict = node.getDefDict()
+    # 1. Collect all ROUTE statements and identify scene default TimeSensors
+    raw_routes = []
+    default_clock = None
 
-    for field in node.fields:
-        if field and field[0] == 'ROUTE':
-            try:
-                from_id, from_type = field[1].split('.')
-                to_id, to_type = field[3].split('.')
-            except:
-                logger.warning("Invalid ROUTE %s" % field)
-                continue
+    for node, ancestry in all_nodes:
+        if node.getSpec() == 'TimeSensor' and default_clock is None:
+            default_clock = node
+        if hasattr(node, 'fields'):
+            for field in node.fields:
+                if field and field[0] == 'ROUTE':
+                    raw_routes.append((field, ancestry))
 
-            if from_type == 'value_changed':
-                if to_type == 'set_position':
-                    action = getIpo(to_id)
-                    set_data_from_node = defDict.get(from_id)
-                    if set_data_from_node:
-                        translatePositionInterpolator(set_data_from_node, action, ancestry)
+    # 2. Pass 1: map TimeSensor -> Interpolator routes
+    interpolator_clocks = {}
+    for field, ancestry in raw_routes:
+        try:
+            from_parts = field[1].split('.')
+            to_parts = field[3].split('.')
+            from_id = from_parts[0]
+            to_id = to_parts[0]
+        except Exception:
+            continue
 
-                if to_type in {'set_orientation', 'rotation'}:
-                    action = getIpo(to_id)
-                    set_data_from_node = defDict.get(from_id)
-                    if set_data_from_node:
-                        translateOrientationInterpolator(set_data_from_node, action, ancestry)
+        from_node = defDict.get(from_id)
+        if from_node and from_node.getSpec() == 'TimeSensor':
+            interpolator_clocks[to_id] = from_node
 
-                if to_type == 'set_scale':
-                    action = getIpo(to_id)
-                    set_data_from_node = defDict.get(from_id)
-                    if set_data_from_node:
-                        translateScalarInterpolator(set_data_from_node, action, ancestry)
+    # Include clocks associated via ProtoInstances (e.g. MenuItem adapter -> Main_Clock)
+    mgr = getattr(proto_x3d, 'manager', None)
+    adapter_clocks = getattr(mgr, 'adapter_clocks', None) or getattr(proto_x3d, 'adapter_clocks', {})
+    for adapter_def, clock_def in adapter_clocks.items():
+        clock_node = defDict.get(clock_def) or defDict.get('Main_Clock')
+        if clock_node and adapter_def not in interpolator_clocks:
+            interpolator_clocks[adapter_def] = clock_node
 
-            elif from_type == 'bindTime':
-                action = getIpo(from_id)
-                time_node = defDict.get(to_id)
-                if time_node:
-                    translateTimeSensor(time_node, action, ancestry)
+    # 3. Pass 2: process Interpolator -> Target routes
+    for field, ancestry in raw_routes:
+        try:
+            from_parts = field[1].split('.')
+            to_parts = field[3].split('.')
+            from_id, from_type = from_parts[0], from_parts[1] if len(from_parts) > 1 else ''
+            to_id, to_type = to_parts[0], to_parts[1] if len(to_parts) > 1 else ''
+        except Exception:
+            logger.warning("Invalid ROUTE %s" % field)
+            continue
 
+        from_node = defDict.get(from_id)
+        to_node = defDict.get(to_id)
+        if not from_node:
+            continue
+
+        clock = interpolator_clocks.get(from_id, default_clock)
+
+        # Identify target datablock (Mesh ShapeKeys, Armature, or Object)
+        target_datablock = None
+        if to_node is not None:
+            real_to_node = to_node.getRealNode() if hasattr(to_node, 'getRealNode') else to_node
+            to_spec = to_node.getSpec()
+            if to_spec == 'HAnimDisplacer':
+                mesh_obj = getattr(to_node, 'blendObject', None) or getattr(real_to_node, 'blendObject', None)
+                if mesh_obj and mesh_obj.data and mesh_obj.data.shape_keys:
+                    target_datablock = mesh_obj.data.shape_keys
+            elif to_spec == 'HAnimJoint':
+                target_datablock = getattr(to_node, 'blendObject', None) or getattr(real_to_node, 'blendObject', None)
+            else:
+                target_datablock = getattr(to_node, 'blendObject', None) or getattr(real_to_node, 'blendObject', None)
+
+        # Reuse existing action on target datablock so all curves share one Action
+        if target_datablock is not None:
+            if target_datablock.animation_data is None:
+                target_datablock.animation_data_create()
+            if target_datablock.animation_data.action is not None:
+                action = target_datablock.animation_data.action
+            else:
+                action_name = getattr(target_datablock, "name", from_id)
+                action = getIpo(action_name)
+                _bind_action_to_datablock(target_datablock, action)
+        else:
+            action = getIpo(from_id)
+
+        # Translate Interpolators
+        from_spec = from_node.getSpec()
+        if from_type in {'value_changed', 'fraction_changed'} or from_spec.endswith('Interpolator'):
+            if from_spec == 'PositionInterpolator' or to_type in {'set_position', 'set_translation', 'translation', 'position'}:
+                translatePositionInterpolator(from_node, action, ancestry, target_node=to_node, target_field=to_type, clock_node=clock, default_clock=default_clock)
+
+            elif from_spec == 'OrientationInterpolator' or to_type in {'set_orientation', 'set_rotation', 'rotation', 'orientation'}:
+                translateOrientationInterpolator(from_node, action, ancestry, target_node=to_node, target_field=to_type, clock_node=clock, default_clock=default_clock)
+
+            elif from_spec == 'ScalarInterpolator' or to_type in {'set_fraction', 'set_scale', 'scale', 'weight', 'set_weight'}:
+                translateScalarInterpolator(from_node, action, ancestry, target_node=to_node, target_field=to_type, clock_node=clock, default_clock=default_clock)
+
+        elif from_type == 'bindTime' and to_node:
+            translateTimeSensor(to_node, action, ancestry)
+
+        # Ensure slot binding is refreshed now that curves/slots exist
+        if target_datablock is not None:
+            _bind_action_to_datablock(target_datablock, action)
+
+    # 4. Bind orphan target actions created directly by DEF keys if any
+    for key, action in routeIpoDict.items():
+        if key not in defDict:
+            continue
+        node = defDict[key]
+        if node.blendObject is None and node.blendData is None:
+            if node.getSpec() not in {'HAnimDisplacer', 'HAnimJoint', 'HAnimSegment', 'HAnimSite'}:
+                bpyob = node.blendData = node.blendObject = bpy.data.objects.new('AnimOb', None)
+                bpycollection.objects.link(bpyob)
+                bpyob.select_set(True)
+                _bind_action_to_datablock(bpyob, action)
+
+
+def importRoute(node, ancestry):
+    """Backwards-compatibility stub; route processing is handled in process_all_routes."""
+    return
+
+
+# -----------------------------------------------------------------------------------
+# Main entry points
+# -----------------------------------------------------------------------------------
 
 def load_web3d(
         bpycontext,
@@ -3075,6 +3522,11 @@ def load_web3d(
     GLOBALS['CIRCLE_DETAIL'] = PREF_CIRCLE_DIV
     conversion_scale = global_scale
     material_cache = {}
+
+    if proto_x3d is not None and getattr(proto_x3d, "manager", None) is not None:
+        proto_x3d.manager.reset()
+    elif proto_x3d is not None and hasattr(proto_x3d, "reset"):
+        proto_x3d.reset()
 
     if as_collection:
         active_collection = bpy.context.view_layer.active_layer_collection.collection
@@ -3125,27 +3577,8 @@ def load_web3d(
         elif spec == 'Sound':
             importAudio(bpycollection, node, ancestry, global_matrix)
 
-    for node, ancestry in all_nodes:
-        importRoute(node, ancestry)
-
-    for node, ancestry in all_nodes:
-        if node.isRoot():
-            routeIpoDict = node.getRouteIpoDict()
-            defDict = node.getDefDict()
-
-            for key, action in routeIpoDict.items():
-                if key not in defDict:
-                    continue
-                node = defDict[key]
-                if node.blendData is None:
-                    bpyob = node.blendData = node.blendObject = bpy.data.objects.new('AnimOb', None)
-                    bpycollection.objects.link(bpyob)
-                    bpyob.select_set(True)
-
-                if node.blendData.animation_data is None:
-                    node.blendData.animation_data_create()
-
-                node.blendData.animation_data.action = action
+    # Process all ROUTE, TimeSensor, and Interpolator animations
+    process_all_routes(all_nodes, root_node, bpycollection)
 
     if PREF_FLAT is False:
         child_dict = {}
@@ -3209,3 +3642,4 @@ def load(context,
                    solidify_value=solidify_value)
 
     return {'FINISHED'}
+
