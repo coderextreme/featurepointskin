@@ -73,8 +73,20 @@ class ProtoManager:
         self.protos[name] = proto
         return proto
 
-    def expand_proto_instance(self, parent_x3d_node, instance_element, x3d_node_class, node_normal_type):
-        proto_name = instance_element.getAttribute('name')
+    # ------------------------------------------------------------------
+    # Pure-DOM instance resolution (no dependency on Blender's x3dNode
+    # tree). Kept separate from expand_proto_instance() so it can be
+    # exercised directly in tests, and so nested ProtoInstance elements
+    # get resolved the same way whether they are top-level or buried
+    # inside another proto's ProtoBody.
+    # ------------------------------------------------------------------
+    def resolve_proto_instance_dom(self, proto_name, instance_element):
+        """Clone the named proto's body, resolve IS/connect wiring against
+        the fieldValues carried on `instance_element`, and return
+        (cloned_body, instance_def, def_map, suffix).
+
+        Returns None if the proto is unknown or has no body.
+        """
         if proto_name not in self.protos:
             logger.warning("ProtoInstance references unknown proto: %s", proto_name)
             return None
@@ -120,6 +132,20 @@ class ProtoManager:
         self._set_cloned_positions(cloned_body)
 
         # 3. Resolve <IS><connect nodeField="..." protoField="..."/></IS>
+        #
+        # The parent of an <IS> can be either:
+        #   (a) an ordinary X3D node (e.g. <Transform>) - field values are
+        #       written as XML attributes, node-valued fields as direct
+        #       element children, or
+        #   (b) another <ProtoInstance> nested inside this proto's body
+        #       (this is how a field gets *forwarded* into a deeper proto -
+        #       exactly what rubikFurnace.x3d does to push "myShape", a Box
+        #       overriding the default Sphere, down through
+        #       twentyseven -> nine -> three -> anyShape). ProtoInstance
+        #       does not take bare attributes or bare node children for its
+        #       fields - it requires <fieldValue name="..."> wrapper
+        #       elements, so those must be created (or reused) here rather
+        #       than writing straight onto the element.
         is_elements = list(cloned_body.getElementsByTagName('IS'))
 
         for is_elem in is_elements:
@@ -127,19 +153,30 @@ class ProtoManager:
             if not parent_elem:
                 continue
 
+            forwarding_into_proto_instance = (parent_elem.tagName == 'ProtoInstance')
+
             for conn in list(is_elem.childNodes):
                 if conn.nodeType == conn.ELEMENT_NODE and conn.tagName == 'connect':
                     node_field = conn.getAttribute('nodeField')
                     proto_field = conn.getAttribute('protoField')
 
-                    if proto_field in field_values:
-                        parent_elem.setAttribute(node_field, field_values[proto_field])
-
-                    if proto_field in field_nodes:
-                        for fn in field_nodes[proto_field]:
-                            cloned_fn = fn.cloneNode(deep=True)
-                            self._set_cloned_positions(cloned_fn)
-                            parent_elem.appendChild(cloned_fn)
+                    if forwarding_into_proto_instance:
+                        target_fv = self._get_or_create_field_value(parent_elem, node_field)
+                        if proto_field in field_values:
+                            target_fv.setAttribute('value', field_values[proto_field])
+                        if proto_field in field_nodes:
+                            for fn in field_nodes[proto_field]:
+                                cloned_fn = fn.cloneNode(deep=True)
+                                self._set_cloned_positions(cloned_fn)
+                                target_fv.appendChild(cloned_fn)
+                    else:
+                        if proto_field in field_values:
+                            parent_elem.setAttribute(node_field, field_values[proto_field])
+                        if proto_field in field_nodes:
+                            for fn in field_nodes[proto_field]:
+                                cloned_fn = fn.cloneNode(deep=True)
+                                self._set_cloned_positions(cloned_fn)
+                                parent_elem.appendChild(cloned_fn)
 
             if is_elem.parentNode:
                 is_elem.parentNode.removeChild(is_elem)
@@ -169,9 +206,32 @@ class ProtoManager:
                     clock_def = def_map.get('Main_Clock', f"Main_Clock{suffix}")
                     self.adapter_clocks[use_ref] = clock_def
 
+        instance_def = instance_element.getAttribute('DEF')
+
+        return cloned_body, instance_def, def_map, suffix
+
+    def _get_or_create_field_value(self, proto_instance_elem, field_name):
+        """Find the <fieldValue name="field_name"> child of a ProtoInstance
+        element, creating and appending one if it doesn't exist yet."""
+        for c in proto_instance_elem.childNodes:
+            if c.nodeType == c.ELEMENT_NODE and c.tagName == 'fieldValue' and c.getAttribute('name') == field_name:
+                return c
+        doc = proto_instance_elem.ownerDocument
+        fv = doc.createElement('fieldValue')
+        fv.setAttribute('name', field_name)
+        proto_instance_elem.appendChild(fv)
+        return fv
+
+    def expand_proto_instance(self, parent_x3d_node, instance_element, x3d_node_class, node_normal_type):
+        proto_name = instance_element.getAttribute('name')
+
+        resolved = self.resolve_proto_instance_dom(proto_name, instance_element)
+        if resolved is None:
+            return None
+        cloned_body, instance_def, def_map, suffix = resolved
+
         # 6. Create the x3dNode for the ProtoInstance itself
         instance_node = x3d_node_class(parent_x3d_node, node_normal_type, instance_element)
-        instance_def = instance_element.getAttribute('DEF')
         if instance_def:
             instance_node.getDefDict()[instance_def] = instance_node
 
@@ -226,4 +286,3 @@ def __getattr__(name):
     if name == "adapter_clocks":
         return get_manager().adapter_clocks
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
