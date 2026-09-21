@@ -14,6 +14,12 @@ Design decisions baked into this module:
 """
 
 import json
+import os
+import re
+import hashlib
+import tempfile
+import urllib.request
+import xml.etree.ElementTree as ET
 import bpy
 import mathutils
 from mathutils import Vector, Matrix, Quaternion
@@ -46,7 +52,7 @@ _FLOAT3_FIELDS = {"center", "translation", "scale", "bboxCenter", "bboxSize",
 _FLOAT4_FIELDS = {"rotation", "scaleOrientation", "limitOrientation"}
 _STRING_FIELDS = {"name", "version", "description"}
 _FLOAT_FIELDS = {"mass", "weight"}
-_INT_ARRAY_FIELDS = {"skinCoordIndex", "coordIndex", "index"}
+_INT_ARRAY_FIELDS = {"skinCoordIndex", "coordIndex", "texCoordIndex", "index"}
 _FLOAT_ARRAY_FIELDS = {"skinCoordWeight", "momentsOfInertia", "ulimit", "llimit",
                        "point", "displacements", "key", "keyValue"}
 
@@ -163,6 +169,483 @@ def _consume_subtree(node, consumed_ids):
         _consume_subtree(child, consumed_ids)
 
 
+
+# ---------------------------------------------------------------------------
+# X3D appearance / animation bridge
+# ---------------------------------------------------------------------------
+
+def _ensure_node_image_material(material, image):
+    """Make a Blender 5.x node material use an ImageTexture as Base Color."""
+    if material is None:
+        material = bpy.data.materials.new("X3D_ImageTexture")
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    out = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if out is None:
+        out = nodes.new("ShaderNodeOutputMaterial")
+    if bsdf is None:
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    tex = next((n for n in nodes if n.type == 'TEX_IMAGE'), None)
+    if tex is None:
+        tex = nodes.new("ShaderNodeTexImage")
+
+    tex.image = image
+    if not any(l.to_node == bsdf and l.to_socket == bsdf.inputs.get("Base Color")
+               for l in links):
+        try:
+            links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+        except Exception:
+            pass
+    if not any(l.to_node == out and l.to_socket == out.inputs.get("Surface")
+               for l in links):
+        try:
+            links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        except Exception:
+            pass
+    return material
+
+
+def _image_urls_from_node(tex_node):
+    """Return ImageTexture URLs, including the common X3D MFString form."""
+    urls = []
+    try:
+        raw = tex_node.getFieldAsStringArray('url', ())
+        if raw:
+            urls.extend(raw)
+    except Exception:
+        pass
+    if not urls:
+        try:
+            raw = tex_node.getFieldAsString('url', None, ())
+        except Exception:
+            raw = None
+        if raw:
+            # Handles: "a.jpg" "https://example/a.jpg"
+            quoted = re.findall(r'"([^"]+)"', raw)
+            urls.extend(quoted or [raw])
+    return [u.strip().strip('"') for u in urls if u and u.strip()]
+
+
+def _load_x3d_image(tex_node):
+    """Load ImageTexture through the stock importer, then robust local/HTTP fallback."""
+    from . import import_x3d as _import_x3d
+
+    try:
+        image = _import_x3d.appearance_LoadImageTexture(tex_node, (), tex_node)
+    except Exception:
+        image = None
+    if image:
+        return image
+
+    urls = _image_urls_from_node(tex_node)
+    filename = getattr(tex_node, "getFilename", lambda: None)()
+    base_dir = os.path.dirname(filename) if filename else os.getcwd()
+
+    for url in urls:
+        # Relative/local URL.
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', url):
+            candidates = [
+                url,
+                os.path.join(base_dir, url),
+                bpy.path.abspath(url),
+            ]
+            for candidate in candidates:
+                candidate = os.path.normpath(candidate)
+                if os.path.exists(candidate):
+                    try:
+                        return bpy.data.images.load(candidate, check_existing=True)
+                    except Exception:
+                        pass
+            continue
+
+        # Remote URL. Cache it in Blender's temporary directory.
+        if url.lower().startswith(("http://", "https://")):
+            ext = os.path.splitext(url.split("?", 1)[0])[1] or ".img"
+            cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest() + ext
+            cache_path = os.path.join(tempfile.gettempdir(), cache_name)
+            try:
+                if not os.path.exists(cache_path):
+                    urllib.request.urlretrieve(url, cache_path)
+                return bpy.data.images.load(cache_path, check_existing=True)
+            except Exception as exc:
+                print("HAnim X3D: unable to load ImageTexture", url, exc)
+
+    return None
+
+
+def _apply_shape_appearance(shape, appearance, ancestry):
+    """Return a modern Blender material/image pair for an X3D Shape."""
+    from . import import_x3d as _import_x3d
+
+    material = None
+    image = None
+    if appearance is not None and hasattr(_import_x3d, "importShape_LoadAppearance"):
+        try:
+            material, image, _ = _import_x3d.importShape_LoadAppearance(
+                shape.getDefName() or "Shape", appearance, ancestry, shape, False
+            )
+        except Exception as exc:
+            print("HAnim X3D: appearance import fallback:", exc)
+
+    real_appr = real_node(appearance) if appearance is not None else None
+    tex_node = (real_appr.getChildBySpec(('ImageTexture', 'PixelTexture'))
+                if real_appr is not None else None)
+
+    if tex_node is not None and tex_node.getSpec() == "ImageTexture":
+        if image is None:
+            image = _load_x3d_image(tex_node)
+        if image is not None:
+            material = _ensure_node_image_material(material, image)
+
+    if material is None:
+        material = bpy.data.materials.new(shape.getDefName() or "X3D_Material")
+        material.use_nodes = True
+
+    return material, image
+
+
+def _split_indexed(values):
+    """Split an X3D index field into per-face integer tuples.
+
+    Blender's X3D parser normally exposes MFInt32 fields as arrays, but
+    some fields (notably texCoordIndex in this importer) can arrive as a
+    whitespace-separated string. Accept both representations.
+    """
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = values.replace(',', ' ').split()
+    faces = []
+    current = []
+    for value in values:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+        value = int(value)
+        if value == -1:
+            if len(current) >= 3:
+                faces.append(tuple(current))
+            current = []
+        else:
+            current.append(value)
+    if len(current) >= 3:
+        faces.append(tuple(current))
+    return faces
+
+
+def _assign_shape_uvs(mesh_data, face_tex_indices, tex_points):
+    if not tex_points or not face_tex_indices:
+        return
+    try:
+        uv_layer = mesh_data.uv_layers.get("X3D_UV") or mesh_data.uv_layers.new(name="X3D_UV")
+        loop_index = 0
+        for poly, tex_face in zip(mesh_data.polygons, face_tex_indices):
+            for corner, tex_index in zip(range(poly.loop_start, poly.loop_start + poly.loop_total),
+                                         tex_face):
+                if 0 <= int(tex_index) < len(tex_points):
+                    uv = tex_points[int(tex_index)]
+                    if len(uv) >= 2:
+                        uv_layer.data[corner].uv = (float(uv[0]), float(uv[1]))
+                loop_index += 1
+    except Exception as exc:
+        print("HAnim X3D: UV assignment failed:", exc)
+
+
+def _find_source_root(node):
+    p = node
+    while getattr(p, "parent", None) is not None:
+        p = p.parent
+    return p
+
+
+def _parse_x3d_animation_metadata(filename):
+    """Read only ROUTE/MenuItem/ScalarInterpolator metadata from the source X3D."""
+    if not filename or not os.path.exists(filename):
+        return None
+    try:
+        root = ET.parse(filename).getroot()
+    except Exception as exc:
+        print("HAnim X3D: XML animation metadata unavailable:", exc)
+        return None
+
+    nodes = {}
+    for elem in root.iter():
+        tag = elem.tag.rsplit("}", 1)[-1]
+        if elem.get("DEF"):
+            nodes[elem.get("DEF")] = (tag, elem)
+
+    routes = []
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] == "ROUTE":
+            routes.append((
+                elem.get("fromNode"), elem.get("fromField"),
+                elem.get("toNode"), elem.get("toField")
+            ))
+
+    menus = []
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] != "ProtoInstance" or elem.get("name") != "MenuItem":
+            continue
+        fields = {}
+        for fv in elem:
+            if fv.tag.rsplit("}", 1)[-1] == "fieldValue":
+                fields[fv.get("name")] = fv.get("value", "")
+        menu_id = elem.get("DEF")
+        if menu_id:
+            menus.append({
+                "id": menu_id,
+                "description": fields.get("description", menu_id),
+            })
+
+    return nodes, routes, menus
+
+
+def _parse_x3d_numbers(value):
+    if not value:
+        return []
+    return [float(v) for v in re.split(r'[\s,]+', value.strip()) if v]
+
+
+def _menu_animation_graph(metadata, menu_id):
+    nodes, routes, menus = metadata
+    from_map = {}
+    for a, b, c, d in routes:
+        from_map.setdefault((a, b), []).append((c, d))
+
+    clock = None
+    for target, field in from_map.get((menu_id, "startTime"), []):
+        if field == "startTime":
+            clock = target
+            break
+    if not clock:
+        return {}
+
+    adapters = [
+        target for target, field in from_map.get((clock, "fraction_changed"), [])
+        if field == "set_fraction"
+    ]
+
+    result = {}
+    for adapter in adapters:
+        info = nodes.get(adapter)
+        if not info or info[0] not in {"ScalarInterpolator", "FloatVertexAttribute"}:
+            continue
+        elem = info[1]
+        keys = _parse_x3d_numbers(elem.get("key"))
+        values = _parse_x3d_numbers(elem.get("keyValue"))
+        if not keys or not values:
+            continue
+        # ScalarInterpolator: one scalar per key.
+        values = values[:len(keys)]
+
+        for target, field in from_map.get((adapter, "value_changed"), []):
+            if field != "weight":
+                continue
+            result[target] = (keys, values)
+    return result
+
+
+def _register_animation_ui():
+    """Install the Blender Sidebar controls once."""
+    try:
+        bpy.types.Scene.hanim_x3d_active_menu
+    except AttributeError:
+        bpy.types.Scene.hanim_x3d_active_menu = bpy.props.StringProperty(
+            name="X3D Animation", default=""
+        )
+
+    class X3D_HANIM_OT_PlayMenu(bpy.types.Operator):
+        bl_idname = "hanim_x3d.play_menu"
+        bl_label = "Play X3D Animation"
+        menu_id: bpy.props.StringProperty()
+
+        def execute(self, context):
+            _activate_hanim_menu(self.menu_id)
+            return {'FINISHED'}
+
+    class X3D_HANIM_PT_Menu(bpy.types.Panel):
+        bl_label = "X3D HAnim Menu"
+        bl_idname = "X3D_HANIM_PT_Menu"
+        bl_space_type = 'VIEW_3D'
+        bl_region_type = 'UI'
+        bl_category = "X3D"
+
+        def draw(self, context):
+            layout = self.layout
+            items = []
+            for sk in bpy.data.shape_keys:
+                raw = sk.get("hanim_menu_items")
+                if raw:
+                    try:
+                        items = json.loads(raw)
+                    except Exception:
+                        pass
+                    if items:
+                        break
+            if not items:
+                layout.label(text="No X3D MenuItems found")
+                return
+            for item in items:
+                op = layout.operator(
+                    "hanim_x3d.play_menu",
+                    text=item["description"],
+                    depress=(context.scene.hanim_x3d_active_menu == item["id"])
+                )
+                op.menu_id = item["id"]
+
+    # Avoid duplicate registration if the module is reloaded.
+    for cls in (X3D_HANIM_OT_PlayMenu, X3D_HANIM_PT_Menu):
+        try:
+            bpy.utils.register_class(cls)
+        except ValueError:
+            pass
+
+
+def _activate_hanim_menu(menu_id):
+    scene = bpy.context.scene
+    # Reset all imported facial shape keys before installing the selected action.
+    for sk in bpy.data.shape_keys:
+        if sk.get("hanim_menu_items"):
+            if sk.animation_data:
+                sk.animation_data.action = None
+            for kb in sk.key_blocks:
+                kb.value = 0.0
+
+    if menu_id == "Reset":
+        scene.hanim_x3d_active_menu = "Reset"
+        return
+
+    for sk in bpy.data.shape_keys:
+        raw = sk.get("hanim_menu_actions")
+        if not raw:
+            continue
+        try:
+            actions = json.loads(raw)
+        except Exception:
+            continue
+        action_name = actions.get(menu_id)
+        if action_name:
+            action = bpy.data.actions.get(action_name)
+            if action:
+                sk.animation_data_create()
+                sk.animation_data.action = action
+                # In Blender 5.x, explicitly select the compatible slot when
+                # one is available.  This avoids an Action being assigned but
+                # not actually driving the Shape Keys data-block.
+                try:
+                    suitable = sk.animation_data.action_suitable_slots
+                    if suitable:
+                        sk.animation_data.action_slot = suitable[0]
+                except (AttributeError, RuntimeError):
+                    pass
+
+    scene.hanim_x3d_active_menu = menu_id
+
+
+def _build_hanim_animation_actions(humanoid_node):
+    """
+    Convert the source X3D MenuItem -> TimeSensor -> ScalarInterpolator ->
+    HAnimDisplacer ROUTE graph into Blender shape-key Actions.
+    """
+    filename = getattr(humanoid_node, "getFilename", lambda: None)()
+    metadata = _parse_x3d_animation_metadata(filename)
+    if not metadata:
+        return
+
+    _, _, menus = metadata
+    menu_map = {m["id"]: m for m in menus}
+
+    # DEF name -> (Shape Keys ID, key-block name)
+    displacer_map = {}
+    for sk in bpy.data.shape_keys:
+        raw = sk.get(prop("displacers"))
+        if not raw:
+            continue
+        try:
+            info = json.loads(raw)
+        except Exception:
+            continue
+        for key_name, meta in info.items():
+            def_name = meta.get("def_name")
+            if def_name:
+                displacer_map[def_name] = (sk, key_name)
+
+    if not displacer_map:
+        return
+
+    # Build actions independently on every Shape Keys datablock.
+    for sk in bpy.data.shape_keys:
+        relevant = {d: v for d, v in displacer_map.items() if v[0] == sk}
+        if not relevant:
+            continue
+
+        action_names = {}
+        for menu_id, menu in menu_map.items():
+            if menu_id == "Reset":
+                continue
+            graph = _menu_animation_graph(metadata, menu_id)
+            if not graph:
+                continue
+
+            targets = [(def_name, key_name, graph[def_name])
+                       for def_name, (_, key_name) in relevant.items()
+                       if def_name in graph]
+            if not targets:
+                continue
+
+            action = bpy.data.actions.new(
+                f"X3D_{menu_id}_{sk.name}"
+            )
+            action["hanim_menu_id"] = menu_id
+            action["hanim_source"] = filename or ""
+
+            # Blender 5.x requires the Action to be assigned to the ID before
+            # fcurve_ensure_for_datablock() can create its channel.
+            sk.animation_data_create()
+            sk.animation_data.action = action
+
+            for _, key_name, (keys, values) in targets:
+                # Blender 5.x uses slotted Actions.  The old
+                # action.fcurves API was removed in Blender 5.0.
+                # fcurve_ensure_for_datablock() creates the appropriate
+                # slot/layer/strip/channelbag for this Shape Keys ID.
+                fcurve = action.fcurve_ensure_for_datablock(
+                    sk,
+                    data_path=f'key_blocks["{key_name}"].value',
+                    index=0,
+                )
+                for key, value in zip(keys, values):
+                    frame = 1.0 + float(key) * 29.0
+                    fcurve.keyframe_points.insert(frame, float(value), options={'FAST'})
+                fcurve.update()
+                # Blender 5.x exposes only CONSTANT/LINEAR as FCurve
+                # extrapolation modes.  Cyclic playback is represented by a
+                # Cycles F-Modifier instead.
+                if not any(mod.type == 'CYCLES' for mod in fcurve.modifiers):
+                    fcurve.modifiers.new(type='CYCLES')
+
+            action_names[menu_id] = action.name
+
+        # The imported model should start unanimated; the sidebar operator
+        # assigns whichever MenuItem the user selects.
+        if sk.animation_data:
+            sk.animation_data.action = None
+
+        if action_names:
+            sk["hanim_menu_actions"] = json.dumps(action_names)
+            sk["hanim_menu_items"] = json.dumps(
+                [m for m in menus],
+                separators=(",", ":")
+            )
+
+    _register_animation_ui()
+    print("HAnim X3D: installed", len(menus), "MenuItems as Blender animation controls.")
+
+
 # ---------------------------------------------------------------------------
 # Import logic
 # ---------------------------------------------------------------------------
@@ -217,6 +700,10 @@ def import_humanoid(bpycollection, humanoid_node, ancestry, global_matrix, conte
             _import_body_recursive(context, real_child, armature_obj, bone_name,
                                    joint_bone_names, bpycollection, body_mesh_obj,
                                    consumed_ids)
+
+    # Convert this file's MenuItem/ROUTE animation graph into Blender Actions
+    # after all HAnimDisplacer shape keys have been created.
+    _build_hanim_animation_actions(humanoid_node)
 
     return consumed_ids
 
@@ -540,16 +1027,18 @@ def import_segment(context, segment_node, armature_obj, joint_bone_name,
 
 
 def import_segment_own_geometry(mesh_data, segment_node):
-    """Imports segment geometry walking Transform wrappers and baking translations/rotations."""
+    """Import segment geometry, preserving per-Shape materials and X3D UVs."""
     verts = []
     faces = []
+    face_materials = []
+    face_tex_indices = []
+    materials = []
+    material_slots = {}
     vertex_offset = 0
 
     shape_list = []
     _collect_segment_shapes(segment_node, Matrix.Identity(4), shape_list)
     primary_matrix = shape_list[0][1] if shape_list else Matrix.Identity(4)
-
-    from . import import_x3d as _import_x3d
 
     for shape, matrix in shape_list:
         geometry = (shape.getChildBySpec('IndexedFaceSet') or
@@ -559,52 +1048,134 @@ def import_segment_own_geometry(mesh_data, segment_node):
                     shape.getChildBySpec('TriangleSet'))
         if geometry is None:
             continue
-        geo_type = geometry.getSpec()
 
+        geo_type = geometry.getSpec()
         coord_node = geometry.getChildBySpec('Coordinate')
         points = get_field(coord_node, "point", []) if coord_node else []
         raw_verts = _grouped(points, 3)
-        for pt in raw_verts:
-            v_transformed = matrix @ Vector(pt)
-            verts.append(v_transformed.to_tuple())
 
-        coord_index = get_field(geometry, "coordIndex", [])
+        for pt in raw_verts:
+            verts.append((matrix @ Vector(pt)).to_tuple())
+
+        local_faces = []
+        local_tex_faces = []
+
         if geo_type == "IndexedFaceSet":
-            current_face = []
-            for idx in coord_index:
-                if idx == -1:
-                    if len(current_face) >= 3:
-                        faces.append(tuple(vertex_offset + i for i in current_face))
-                    current_face = []
-                else:
-                    current_face.append(idx)
-            if len(current_face) >= 3:
-                faces.append(tuple(vertex_offset + i for i in current_face))
+            coord_index = get_field(geometry, "coordIndex", [])
+            local_faces = _split_indexed(coord_index)
+
+            tex_node = geometry.getChildBySpec('TextureCoordinate')
+            tex_points = get_field(tex_node, "point", []) if tex_node else []
+            tex_points = _grouped(tex_points, 2)
+
+            tex_index = get_field(geometry, "texCoordIndex", [])
+            if tex_index:
+                local_tex_faces = _split_indexed(tex_index)
+            elif tex_points:
+                # X3D permits texCoordIndex to be omitted; in that case
+                # coordinate indices are used when the arrays correspond.
+                local_tex_faces = [tuple(f) for f in local_faces]
         else:
             index = get_field(geometry, "index", [])
             if index:
                 for i in range(0, len(index) - 2, 3):
-                    faces.append(tuple(vertex_offset + index[i + k] for k in range(3)))
+                    local_faces.append(tuple(index[i:i + 3]))
             else:
                 for i in range(0, len(raw_verts) - 2, 3):
-                    faces.append((vertex_offset + i, vertex_offset + i + 1, vertex_offset + i + 2))
+                    local_faces.append((i, i + 1, i + 2))
+            tex_node = geometry.getChildBySpec('TextureCoordinate')
+            tex_points = get_field(tex_node, "point", []) if tex_node else []
+            tex_points = _grouped(tex_points, 2)
+            if tex_points:
+                local_tex_faces = [tuple(f) for f in local_faces]
 
-        # Attach materials and appearance if available
+        for face, tex_face in zip(
+                local_faces,
+                local_tex_faces if local_tex_faces else [()] * len(local_faces)):
+            faces.append(tuple(vertex_offset + i for i in face))
+            face_tex_indices.append(tex_face)
+
+        # Preserve the Shape's Appearance, including its ImageTexture.
         appr = shape.getChildBySpec('Appearance')
-        if appr is not None and hasattr(_import_x3d, "importShape_LoadAppearance"):
-            try:
-                bpymat, bpyima, _ = _import_x3d.importShape_LoadAppearance(
-                    shape.getDefName() or "SegmentShape", appr, (), shape, False
-                )
-                if bpymat and bpymat.name not in mesh_data.materials:
-                    mesh_data.materials.append(bpymat)
-            except Exception:
-                pass
+        bpymat, _ = _apply_shape_appearance(shape, appr, ())
+        mat_key = bpymat.name
+        if mat_key not in material_slots:
+            material_slots[mat_key] = len(materials)
+            materials.append(bpymat)
+        slot = material_slots[mat_key]
 
+        face_materials.extend([slot] * len(local_faces))
         vertex_offset += len(raw_verts)
 
     mesh_data.from_pydata(verts, [], faces)
     mesh_data.update()
+
+    for mat in materials:
+        mesh_data.materials.append(mat)
+
+    for poly, slot in zip(mesh_data.polygons, face_materials):
+        poly.material_index = slot
+
+    # All Shapes in this file use TextureCoordinate/texCoordIndex.
+    # Reconstruct the UV layer on the merged mesh.
+    # We need to walk the Shapes a second time to gather their UV points
+    # because UV indices are local to each IndexedFaceSet.
+    loop_cursor = 0
+    for shape, matrix in shape_list:
+        geometry = shape.getChildBySpec('IndexedFaceSet')
+        if geometry is None:
+            continue
+        tex_node = geometry.getChildBySpec('TextureCoordinate')
+        tex_points = _grouped(get_field(tex_node, "point", []) if tex_node else [], 2)
+        if not tex_points:
+            continue
+        local_faces = _split_indexed(get_field(geometry, "coordIndex", []))
+        tex_index = get_field(geometry, "texCoordIndex", [])
+        local_tex_faces = (_split_indexed(tex_index) if tex_index
+                           else [tuple(f) for f in local_faces])
+        for tex_face in local_tex_faces:
+            if loop_cursor >= len(mesh_data.loops):
+                break
+            for tex_index_value in tex_face:
+                if loop_cursor >= len(mesh_data.loops):
+                    break
+                ti = int(tex_index_value)
+                if 0 <= ti < len(tex_points):
+                    mesh_data.loops[loop_cursor]  # force evaluated loop access
+                    loop_cursor += 1
+                else:
+                    loop_cursor += 1
+
+    # Assign UVs with a direct second pass over polygons and the original
+    # per-face texCoordIndex data. This is deliberately kept separate from
+    # mesh creation because Blender creates loop indices only after from_pydata.
+    if face_tex_indices:
+        uv_layer = mesh_data.uv_layers.new(name="X3D_UV") if not mesh_data.uv_layers else mesh_data.uv_layers[0]
+        loop_cursor = 0
+        # Build a flat list of texture coordinates in mesh order.
+        flat_uv = []
+        for shape, matrix in shape_list:
+            geometry = shape.getChildBySpec('IndexedFaceSet')
+            if geometry is None:
+                continue
+            tex_node = geometry.getChildBySpec('TextureCoordinate')
+            tex_points = _grouped(get_field(tex_node, "point", []) if tex_node else [], 2)
+            if not tex_points:
+                continue
+            local_faces = _split_indexed(get_field(geometry, "coordIndex", []))
+            tex_index = get_field(geometry, "texCoordIndex", [])
+            local_tex_faces = (_split_indexed(tex_index) if tex_index
+                               else [tuple(f) for f in local_faces])
+            for tf in local_tex_faces:
+                for ti in tf:
+                    if 0 <= int(ti) < len(tex_points):
+                        flat_uv.append(tuple(tex_points[int(ti)][:2]))
+                    else:
+                        flat_uv.append((0.0, 0.0))
+
+        for loop, uv in zip(mesh_data.loops, flat_uv):
+            uv_layer.data[loop.index].uv = uv
+
     return primary_matrix
 
 
@@ -662,7 +1233,12 @@ def import_displacers(mesh_obj, segment_node, transform_matrix=Matrix.Identity(4
         real_node(disp_node).blendObject = mesh_obj
         real_node(disp_node).blendData = shape_key
 
-    mesh_obj[key] = json.dumps(displacers_meta)
+    raw_displacers = json.dumps(displacers_meta)
+    mesh_obj[key] = raw_displacers
+    # Shape Keys are the Blender ID datablock that owns the animated values;
+    # mirror the metadata there so MenuItem Actions can target them directly.
+    if mesh_obj.data.shape_keys is not None:
+        mesh_obj.data.shape_keys[key] = raw_displacers
 
 
 def import_joint_skin_weights(joint_node, joint_bone_name, mesh_obj):
