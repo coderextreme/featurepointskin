@@ -169,7 +169,6 @@ def _consume_subtree(node, consumed_ids):
         _consume_subtree(child, consumed_ids)
 
 
-
 # ---------------------------------------------------------------------------
 # X3D appearance / animation bridge
 # ---------------------------------------------------------------------------
@@ -223,7 +222,6 @@ def _image_urls_from_node(tex_node):
         except Exception:
             raw = None
         if raw:
-            # Handles: "a.jpg" "https://example/a.jpg"
             quoted = re.findall(r'"([^"]+)"', raw)
             urls.extend(quoted or [raw])
     return [u.strip().strip('"') for u in urls if u and u.strip()]
@@ -245,7 +243,6 @@ def _load_x3d_image(tex_node):
     base_dir = os.path.dirname(filename) if filename else os.getcwd()
 
     for url in urls:
-        # Relative/local URL.
         if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', url):
             candidates = [
                 url,
@@ -261,7 +258,6 @@ def _load_x3d_image(tex_node):
                         pass
             continue
 
-        # Remote URL. Cache it in Blender's temporary directory.
         if url.lower().startswith(("http://", "https://")):
             ext = os.path.splitext(url.split("?", 1)[0])[1] or ".img"
             cache_name = hashlib.sha256(url.encode("utf-8")).hexdigest() + ext
@@ -308,12 +304,7 @@ def _apply_shape_appearance(shape, appearance, ancestry):
 
 
 def _split_indexed(values):
-    """Split an X3D index field into per-face integer tuples.
-
-    Blender's X3D parser normally exposes MFInt32 fields as arrays, but
-    some fields (notably texCoordIndex in this importer) can arrive as a
-    whitespace-separated string. Accept both representations.
-    """
+    """Split an X3D index field into per-face integer tuples."""
     if values is None:
         return []
     if isinstance(values, str):
@@ -411,8 +402,6 @@ def _parse_x3d_numbers(value):
 
 
 def _menu_clock(metadata, menu_id):
-    """DEF name of the TimeSensor a MenuItem's startTime event is routed to,
-    or None if this menu_id isn't wired to a clock at all."""
     nodes, routes, menus = metadata
     from_map = {}
     for a, b, c, d in routes:
@@ -449,7 +438,6 @@ def _menu_animation_graph(metadata, menu_id):
         values = _parse_x3d_numbers(elem.get("keyValue"))
         if not keys or not values:
             continue
-        # ScalarInterpolator: one scalar per key.
         values = values[:len(keys)]
 
         for target, field in from_map.get((adapter, "value_changed"), []):
@@ -459,9 +447,6 @@ def _menu_animation_graph(metadata, menu_id):
     return result
 
 
-# Mirrors import_x3d._ID_TYPE_COLLECTIONS so a tagged Action's
-# x3d_target_id_type/x3d_target_id_name pair can be resolved back to a
-# live datablock without importing import_x3d here.
 _ID_TYPE_COLLECTIONS = {
     'OBJECT': 'objects',
     'ARMATURE': 'armatures',
@@ -471,8 +456,6 @@ _ID_TYPE_COLLECTIONS = {
 
 
 def _resolve_tagged_datablock(action):
-    """Look up the datablock an x3d_timesensor-tagged Action was bound to at
-    import time, via the id_type/name it was stamped with."""
     id_type = action.get("x3d_target_id_type")
     id_name = action.get("x3d_target_id_name")
     if not id_type or not id_name:
@@ -485,23 +468,15 @@ def _resolve_tagged_datablock(action):
 
 
 def _prettify_clock_name(def_name):
-    """Fall back label for a standalone TimeSensor with no MenuItem: turn a
-    DEF like 'DefaultTimer' or 'Wave_Clock' into 'Default Timer' / 'Wave Clock'."""
     text = def_name.replace('_', ' ')
-    text = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', text)     # camelCase boundary
-    text = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', text)   # ...ABCd -> ...AB Cd
-    text = re.sub(r'(?<=[A-Za-z])(?=[0-9])', ' ', text)     # letter -> digit
+    text = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', text)
+    text = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', text)
+    text = re.sub(r'(?<=[A-Za-z])(?=[0-9])', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text or def_name
 
 
 def _collect_standalone_clocks(used_clock_defs):
-    """Group Actions tagged by process_all_routes (import_x3d.py) by their
-    source TimeSensor DEF, skipping any clock already exposed through a
-    MenuItem entry. One entry per remaining clock becomes a menu item so
-    animations that aren't wired to a MenuItem proto (e.g. a bare looping
-    TimeSensor driving an armature directly) are still selectable from the
-    X3D HAnim Menu sidebar."""
     by_clock = {}
     for action in bpy.data.actions:
         clock_def = action.get("x3d_timesensor")
@@ -519,7 +494,6 @@ def _collect_standalone_clocks(used_clock_defs):
 
 
 def _register_animation_ui():
-    """Install the Blender Sidebar controls once."""
     try:
         bpy.types.Scene.hanim_x3d_active_menu
     except AttributeError:
@@ -553,7 +527,6 @@ def _register_animation_ui():
                 except Exception:
                     items = []
             if not items:
-                # Back-compat: older imports stored the list per shape key.
                 for sk in bpy.data.shape_keys:
                     raw = sk.get("hanim_menu_items")
                     if raw:
@@ -574,7 +547,6 @@ def _register_animation_ui():
                 )
                 op.menu_id = item["id"]
 
-    # Avoid duplicate registration if the module is reloaded.
     for cls in (X3D_HANIM_OT_PlayMenu, X3D_HANIM_PT_Menu):
         try:
             bpy.utils.register_class(cls)
@@ -587,9 +559,6 @@ def _assign_action(datablock, action):
         return
     datablock.animation_data_create()
     datablock.animation_data.action = action
-    # In Blender 5.x, explicitly select the compatible slot when one is
-    # available. This avoids an Action being assigned but not actually
-    # driving the target data-block.
     try:
         suitable = datablock.animation_data.action_suitable_slots
         if suitable:
@@ -601,7 +570,6 @@ def _assign_action(datablock, action):
 def _activate_hanim_menu(menu_id):
     scene = bpy.context.scene
 
-    # Reset all imported facial shape keys before installing the selected action.
     for sk in bpy.data.shape_keys:
         if sk.get("hanim_menu_items"):
             if sk.animation_data:
@@ -609,9 +577,6 @@ def _activate_hanim_menu(menu_id):
             for kb in sk.key_blocks:
                 kb.value = 0.0
 
-    # Reset every datablock currently driven by an X3D-tagged Action
-    # (armatures, objects, and any shape keys not already covered above),
-    # so switching entries never leaves a previous clock's pose applied.
     for action in bpy.data.actions:
         if not action.get("x3d_timesensor"):
             continue
@@ -623,7 +588,6 @@ def _activate_hanim_menu(menu_id):
         scene.hanim_x3d_active_menu = "Reset"
         return
 
-    # Path 1: MenuItem-driven facial shape-key actions (existing mechanism).
     matched = False
     for sk in bpy.data.shape_keys:
         raw = sk.get("hanim_menu_actions")
@@ -640,9 +604,6 @@ def _activate_hanim_menu(menu_id):
                 _assign_action(sk, action)
                 matched = True
 
-    # Path 2: standalone TimeSensors (no MenuItem) tagged directly on their
-    # Actions by process_all_routes. Covers armatures/objects as well as any
-    # shape keys not reached via Path 1.
     if not matched:
         for action in bpy.data.actions:
             if action.get("x3d_timesensor") != menu_id:
@@ -655,10 +616,6 @@ def _activate_hanim_menu(menu_id):
 
 
 def _build_hanim_animation_actions(humanoid_node):
-    """
-    Convert the source X3D MenuItem -> TimeSensor -> ScalarInterpolator ->
-    HAnimDisplacer ROUTE graph into Blender shape-key Actions.
-    """
     filename = getattr(humanoid_node, "getFilename", lambda: None)()
     metadata = _parse_x3d_animation_metadata(filename)
     if not metadata:
@@ -667,7 +624,6 @@ def _build_hanim_animation_actions(humanoid_node):
     _, _, menus = metadata
     menu_map = {m["id"]: m for m in menus}
 
-    # DEF name -> (Shape Keys ID, key-block name)
     displacer_map = {}
     for sk in bpy.data.shape_keys:
         raw = sk.get(prop("displacers"))
@@ -682,9 +638,6 @@ def _build_hanim_animation_actions(humanoid_node):
             if def_name:
                 displacer_map[def_name] = (sk, key_name)
 
-    # Build actions independently on every Shape Keys datablock. Skipped
-    # entirely for files with no facial displacers (e.g. skeleton-only
-    # rigs) -- those still get standalone-clock entries below.
     if displacer_map:
         for sk in bpy.data.shape_keys:
             relevant = {d: v for d, v in displacer_map.items() if v[0] == sk}
@@ -711,16 +664,10 @@ def _build_hanim_animation_actions(humanoid_node):
                 action["hanim_menu_id"] = menu_id
                 action["hanim_source"] = filename or ""
 
-                # Blender 5.x requires the Action to be assigned to the ID before
-                # fcurve_ensure_for_datablock() can create its channel.
                 sk.animation_data_create()
                 sk.animation_data.action = action
 
                 for _, key_name, (keys, values) in targets:
-                    # Blender 5.x uses slotted Actions.  The old
-                    # action.fcurves API was removed in Blender 5.0.
-                    # fcurve_ensure_for_datablock() creates the appropriate
-                    # slot/layer/strip/channelbag for this Shape Keys ID.
                     fcurve = action.fcurve_ensure_for_datablock(
                         sk,
                         data_path=f'key_blocks["{key_name}"].value',
@@ -730,16 +677,11 @@ def _build_hanim_animation_actions(humanoid_node):
                         frame = 1.0 + float(key) * 29.0
                         fcurve.keyframe_points.insert(frame, float(value), options={'FAST'})
                     fcurve.update()
-                    # Blender 5.x exposes only CONSTANT/LINEAR as FCurve
-                    # extrapolation modes.  Cyclic playback is represented by a
-                    # Cycles F-Modifier instead.
                     if not any(mod.type == 'CYCLES' for mod in fcurve.modifiers):
                         fcurve.modifiers.new(type='CYCLES')
 
                 action_names[menu_id] = action.name
 
-            # The imported model should start unanimated; the sidebar operator
-            # assigns whichever MenuItem the user selects.
             if sk.animation_data:
                 sk.animation_data.action = None
 
@@ -750,28 +692,14 @@ def _build_hanim_animation_actions(humanoid_node):
                     separators=(",", ":")
                 )
 
-    # Actual UI registration (including any standalone, non-MenuItem
-    # TimeSensors) happens once per file in finalize_animation_menu(), after
-    # import_x3d.process_all_routes() has tagged every X3D-driven Action --
-    # that tagging is what standalone-clock discovery depends on, and it
-    # runs after this function during import.
     _pending_menu_metadata.append(metadata)
     print("HAnim X3D: found", len(menu_map), "MenuItem(s) for", filename or humanoid_node)
 
 
-# Accumulates (nodes, routes, menus) metadata across every HAnimHumanoid
-# processed during the current import, so finalize_animation_menu() can
-# compute the full set of MenuItem-covered clocks even when a scene has
-# more than one humanoid.
 _pending_menu_metadata = []
 
 
 def finalize_animation_menu():
-    """Call once per file import, after import_x3d.process_all_routes() has
-    tagged every X3D-driven Action with its source TimeSensor DEF. Merges
-    MenuItem entries (collected earlier by _build_hanim_animation_actions)
-    with one entry per standalone TimeSensor not already covered by a
-    MenuItem, and installs the combined list as the HAnim sidebar menu."""
     global _pending_menu_metadata
 
     all_menus = []
@@ -821,7 +749,6 @@ def import_humanoid(bpycollection, humanoid_node, ancestry, global_matrix, conte
     consumed_ids.update(id(n) for n in root_joints)
     consumed_ids.update(id(real_node(n)) for n in root_joints)
 
-    # Set references on humanoid_node so DEF/USE can resolve directly
     humanoid_node.blendObject = armature_obj
     humanoid_node.blendData = armature_obj.data
     real_node(humanoid_node).blendObject = armature_obj
@@ -831,7 +758,6 @@ def import_humanoid(bpycollection, humanoid_node, ancestry, global_matrix, conte
     skin_coord_node = humanoid_node.getChildBySpec('Coordinate')
     skin_shape_node = humanoid_node.getChildBySpec('Shape')
 
-    # Fallback: skin Coordinate inside skin Shape geometry
     if skin_coord_node is None and skin_shape_node is not None:
         geom = (skin_shape_node.getChildBySpec('IndexedFaceSet') or
                 skin_shape_node.getChildBySpec('IndexedTriangleSet'))
@@ -846,7 +772,6 @@ def import_humanoid(bpycollection, humanoid_node, ancestry, global_matrix, conte
             humanoid_node, skin_coord_node, skin_shape_node,
             armature_obj, bpycollection)
 
-    # Pass 2/3: Traverse only from the true root joint(s)
     for real_child in root_joints:
         spec = real_child.getSpec()
         if spec == 'HAnimJoint':
@@ -859,8 +784,6 @@ def import_humanoid(bpycollection, humanoid_node, ancestry, global_matrix, conte
                                    joint_bone_names, bpycollection, body_mesh_obj,
                                    consumed_ids)
 
-    # Convert this file's MenuItem/ROUTE animation graph into Blender Actions
-    # after all HAnimDisplacer shape keys have been created.
     _build_hanim_animation_actions(humanoid_node)
 
     return consumed_ids
@@ -998,7 +921,6 @@ def import_humanoid_armature(context, humanoid_node, collection):
     consumed_real_ids = set()
     top_level_real_children = unique_real_children(humanoid_node, consumed_real_ids)
 
-    # Identify true skeleton roots
     root_joints = [
         n for n in top_level_real_children
         if n.getSpec() == 'HAnimJoint' and getattr(n, 'parent', None) == humanoid_node
@@ -1019,7 +941,6 @@ def import_humanoid_armature(context, humanoid_node, collection):
 
     bpy.ops.object.mode_set(mode='OBJECT')
 
-    # Re-apply custom properties to Bone datablocks in Object Mode
     for b_name, props in bone_custom_props.items():
         if b_name in armature_data.bones:
             b = armature_data.bones[b_name]
@@ -1046,6 +967,24 @@ def resolve_bone_tails(armature_data, world_matrices):
 
         if (bone.tail - bone.head).length < 1e-6:
             bone.tail = bone.head + Vector((0.0, 0.01, 0.0))
+
+        # Explicitly align bone roll to avoid Blender's Damped Track -Y singularity
+        # where local axes can flip 180 degrees.
+        # In H-Anim: +Y is UP, +Z is FORWARD, +X is LATERAL (humanoid's left).
+        bone_vec = bone.tail - bone.head
+        if bone_vec.length > 1e-6:
+            y_comp = bone_vec.normalized().y
+            if y_comp < -0.5:
+                # Downward bones (legs, arms hanging down):
+                # Aligning local Z to (0, 0, -1) makes local X = (-Y) x (-Z) = (+X, 0, 0)
+                bone.align_roll(Vector((0.0, 0.0, -1.0)))
+            elif y_comp > 0.5:
+                # Upward bones (spine, neck, head):
+                # Aligning local Z to (0, 0, 1) makes local X = (+Y) x (+Z) = (+X, 0, 0)
+                bone.align_roll(Vector((0.0, 0.0, 1.0)))
+            else:
+                # Horizontal or angled bones (arms in T-pose, feet):
+                bone.align_roll(Vector((0.0, 0.0, 1.0)))
 
 
 def _leaf_tail_direction(bone, world_matrices):
@@ -1076,7 +1015,6 @@ def _import_joint_recursive(armature_data, joint_node, armature_obj=None,
     bone = armature_data.edit_bones.new(joint_name)
     joint_bone_names[joint_name] = bone.name
 
-    # Set blendObject and blendData so import_x3d can route to this joint's bone
     if armature_obj is not None:
         joint_node.blendObject = armature_obj
         joint_node.blendData = bone.name
@@ -1161,7 +1099,6 @@ def import_segment(context, segment_node, armature_obj, joint_bone_name,
 
     collection.objects.link(mesh_obj)
 
-    # Register blendObject and blendData for DEF/USE and ROUTE resolution
     segment_node.blendObject = mesh_obj
     segment_node.blendData = mesh_obj.data
     real_node(segment_node).blendObject = mesh_obj
@@ -1171,7 +1108,6 @@ def import_segment(context, segment_node, armature_obj, joint_bone_name,
         modifier = mesh_obj.modifiers.new(name="HAnimSkin", type='ARMATURE')
         modifier.object = armature_obj
 
-    # Import HAnimDisplacer children as Blender Shape Keys
     import_displacers(mesh_obj, segment_node, primary_matrix if not uses_shared_skin else Matrix.Identity(4))
 
     for field_name in SEGMENT_PROPS:
@@ -1230,8 +1166,6 @@ def import_segment_own_geometry(mesh_data, segment_node):
             if tex_index:
                 local_tex_faces = _split_indexed(tex_index)
             elif tex_points:
-                # X3D permits texCoordIndex to be omitted; in that case
-                # coordinate indices are used when the arrays correspond.
                 local_tex_faces = [tuple(f) for f in local_faces]
         else:
             index = get_field(geometry, "index", [])
@@ -1253,7 +1187,6 @@ def import_segment_own_geometry(mesh_data, segment_node):
             faces.append(tuple(vertex_offset + i for i in face))
             face_tex_indices.append(tex_face)
 
-        # Preserve the Shape's Appearance, including its ImageTexture.
         appr = shape.getChildBySpec('Appearance')
         bpymat, _ = _apply_shape_appearance(shape, appr, ())
         mat_key = bpymat.name
@@ -1274,43 +1207,8 @@ def import_segment_own_geometry(mesh_data, segment_node):
     for poly, slot in zip(mesh_data.polygons, face_materials):
         poly.material_index = slot
 
-    # All Shapes in this file use TextureCoordinate/texCoordIndex.
-    # Reconstruct the UV layer on the merged mesh.
-    # We need to walk the Shapes a second time to gather their UV points
-    # because UV indices are local to each IndexedFaceSet.
-    loop_cursor = 0
-    for shape, matrix in shape_list:
-        geometry = shape.getChildBySpec('IndexedFaceSet')
-        if geometry is None:
-            continue
-        tex_node = geometry.getChildBySpec('TextureCoordinate')
-        tex_points = _grouped(get_field(tex_node, "point", []) if tex_node else [], 2)
-        if not tex_points:
-            continue
-        local_faces = _split_indexed(get_field(geometry, "coordIndex", []))
-        tex_index = get_field(geometry, "texCoordIndex", [])
-        local_tex_faces = (_split_indexed(tex_index) if tex_index
-                           else [tuple(f) for f in local_faces])
-        for tex_face in local_tex_faces:
-            if loop_cursor >= len(mesh_data.loops):
-                break
-            for tex_index_value in tex_face:
-                if loop_cursor >= len(mesh_data.loops):
-                    break
-                ti = int(tex_index_value)
-                if 0 <= ti < len(tex_points):
-                    mesh_data.loops[loop_cursor]  # force evaluated loop access
-                    loop_cursor += 1
-                else:
-                    loop_cursor += 1
-
-    # Assign UVs with a direct second pass over polygons and the original
-    # per-face texCoordIndex data. This is deliberately kept separate from
-    # mesh creation because Blender creates loop indices only after from_pydata.
     if face_tex_indices:
         uv_layer = mesh_data.uv_layers.new(name="X3D_UV") if not mesh_data.uv_layers else mesh_data.uv_layers[0]
-        loop_cursor = 0
-        # Build a flat list of texture coordinates in mesh order.
         flat_uv = []
         for shape, matrix in shape_list:
             geometry = shape.getChildBySpec('IndexedFaceSet')
@@ -1353,7 +1251,6 @@ def import_displacers(mesh_obj, segment_node, transform_matrix=Matrix.Identity(4
     basis_key = mesh_obj.data.shape_keys.key_blocks[0]
     rot_scale_mat = transform_matrix.to_3x3()
 
-    # Load or initialize displacer metadata dict on mesh_obj (ID datablock)
     key = prop("displacers")
     raw = mesh_obj.get(key, None)
     try:
@@ -1376,7 +1273,6 @@ def import_displacers(mesh_obj, segment_node, transform_matrix=Matrix.Identity(4
                 d_vec = rot_scale_mat @ Vector(delta)
                 shape_key.data[idx].co = basis_key.data[idx].co + d_vec
 
-        # Store displacer attributes in the mesh_obj metadata dict
         def_name = disp_node.getDefName()
         displacers_meta[shape_key.name] = {
             "name": disp_name,
@@ -1385,7 +1281,6 @@ def import_displacers(mesh_obj, segment_node, transform_matrix=Matrix.Identity(4
             "displacements": list(displacements_raw),
         }
 
-        # Register blendObject and blendData so ROUTEs/Interpolators resolve directly
         disp_node.blendObject = mesh_obj
         disp_node.blendData = shape_key
         real_node(disp_node).blendObject = mesh_obj
@@ -1393,8 +1288,6 @@ def import_displacers(mesh_obj, segment_node, transform_matrix=Matrix.Identity(4
 
     raw_displacers = json.dumps(displacers_meta)
     mesh_obj[key] = raw_displacers
-    # Shape Keys are the Blender ID datablock that owns the animated values;
-    # mirror the metadata there so MenuItem Actions can target them directly.
     if mesh_obj.data.shape_keys is not None:
         mesh_obj.data.shape_keys[key] = raw_displacers
 
@@ -1629,7 +1522,6 @@ def export_segments_for_bone(armature_obj, bone, body_mesh_obj):
         ifs = export_mesh_as_indexed_face_set(mesh_obj.data)
         seg["children"] = [{"node_type": "Shape", "geometry": ifs}]
 
-        # Reconstruct / export HAnimDisplacer nodes from Shape Keys and stored metadata
         displacers = []
         if mesh_obj.data.shape_keys:
             basis_key = mesh_obj.data.shape_keys.key_blocks[0]

@@ -9,6 +9,7 @@ Or headless from a shell:
     blender --background --python load.py -- model.x3d
     blender --background --python load.py -- model.x3d --save out.blend
     blender --background --python load.py -- model.x3d --keep-scene
+    blender --background --python load.py -- model.x3d --axis-forward -Z --axis-up Y
 """
 
 import os
@@ -49,8 +50,25 @@ def clear_scene():
     bpy.ops.object.delete(use_global=False)
 
 
-def load(filepath, clear=True, axis_forward="Z", axis_up="Y"):
-    """Import filepath and return the list of objects it created."""
+def load(filepath, clear=True, axis_forward="Y", axis_up="Z"):
+    """Import filepath and return the list of objects it created.
+
+    axis_forward/axis_up tell the importer how to interpret the source
+    file's axes ("what direction in the X3D file is forward/up"), and get
+    baked into global_matrix, which is applied rigidly to every imported
+    object -- including HAnimHumanoid armatures (see
+    hanim_x3d.import_humanoid(), which multiplies it straight into
+    armature_obj.matrix_basis). So this one setting reorients both an
+    armature's rest pose *and* all of its baked animation together.
+
+    Blender's io_scene_x3d addon's own stock default is
+    axis_forward="Z", axis_up="Y", which is correct for most plain X3D
+    geometry. For this project's HAnim running-animation content that
+    default left the rig lying down mid-stride instead of upright, so the
+    default here is swapped to axis_forward="Y", axis_up="Z". If a
+    different file needs the stock behavior, pass axis_forward="Z",
+    axis_up="Y" explicitly.
+    """
     filepath = os.path.abspath(os.path.expanduser(filepath))
     if not os.path.isfile(filepath):
         raise FileNotFoundError(filepath)
@@ -87,10 +105,13 @@ def main(argv):
     save_to = None
     if "--save" in argv:
         save_to = argv[argv.index("--save") + 1]
+    axis_forward = argv[argv.index("--axis-forward") + 1] if "--axis-forward" in argv else "Y"
+    axis_up = argv[argv.index("--axis-up") + 1] if "--axis-up" in argv else "Z"
 
-    objects = load(filepath, clear=not keep)
+    objects = load(filepath, clear=not keep, axis_forward=axis_forward, axis_up=axis_up)
 
-    print(f"Imported {len(objects)} object(s) from {filepath}")
+    print(f"Imported {len(objects)} object(s) from {filepath} "
+          f"(axis_forward={axis_forward}, axis_up={axis_up})")
     for obj in objects:
         verts = len(obj.data.vertices) if obj.type == "MESH" else 0
         print(f"  {obj.name:<40} {obj.type:<10} {verts} verts")

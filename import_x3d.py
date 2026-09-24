@@ -3037,7 +3037,6 @@ def action_fcurve_ensure(action, data_path, array_index, datablock=None):
                     pass
 
         if slot is not None:
-            # Try anim_utils helper
             try:
                 from bpy_extras import anim_utils
                 channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
@@ -3052,7 +3051,6 @@ def action_fcurve_ensure(action, data_path, array_index, datablock=None):
             except Exception:
                 pass
 
-            # Manual layer -> strip -> channelbag fallback
             try:
                 if not hasattr(action, "layers") or len(action.layers) == 0:
                     layer = action.layers.new("MainLayer")
@@ -3109,14 +3107,12 @@ def _bind_action_to_datablock(datablock, action):
     if anim_data is None:
         return
 
-    # 1. Assign the action to animation_data
     try:
         if anim_data.action != action:
             anim_data.action = action
     except Exception:
         return
 
-    # 2. Assign action_slot (Blender 4.4+ / 5.x)
     if hasattr(anim_data, "action_slot"):
         try:
             suitable = getattr(anim_data, "action_suitable_slots", None)
@@ -3182,6 +3178,23 @@ def translatePositionInterpolator(node, action, ancestry, target_node=None, targ
         armature_obj = getattr(target_node, 'blendObject', None) or getattr(real_target, 'blendObject', None)
         rest_tx = Vector(target_node.getFieldAsFloatTuple('translation', (0.0, 0.0, 0.0), ancestry))
 
+        # Change-of-basis for translation into bone-local space
+        basis_mat = Matrix.Identity(3)
+        if armature_obj and bone_name in armature_obj.pose.bones:
+            bone = armature_obj.data.bones[bone_name]
+            r_blender = bone.matrix_local.to_3x3()
+            cur = bone
+            r_hanim = Matrix.Identity(3)
+            chain = []
+            while cur:
+                chain.append(cur)
+                cur = cur.parent
+            for b in reversed(chain):
+                mat = hanim_x3d.read_rest_local_matrix(b)
+                if mat is not None:
+                    r_hanim = r_hanim @ mat.to_3x3()
+            basis_mat = r_blender.inverted() @ r_hanim
+
         loc_x = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].location', 0, datablock=armature_obj)
         loc_y = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].location', 1, datablock=armature_obj)
         loc_z = action_fcurve_ensure(action, f'pose.bones["{bone_name}"].location', 2, datablock=armature_obj)
@@ -3191,9 +3204,10 @@ def translatePositionInterpolator(node, action, ancestry, target_node=None, targ
                 break
             x, y, z = key_value[i]
             frame = start_frame + frac * duration * fps
-            loc_x.keyframe_points.insert(frame, x - rest_tx.x)
-            loc_y.keyframe_points.insert(frame, y - rest_tx.y)
-            loc_z.keyframe_points.insert(frame, z - rest_tx.z)
+            delta = basis_mat @ (Vector((x, y, z)) - rest_tx)
+            loc_x.keyframe_points.insert(frame, delta.x)
+            loc_y.keyframe_points.insert(frame, delta.y)
+            loc_z.keyframe_points.insert(frame, delta.z)
 
         for fcu in (loc_x, loc_y, loc_z):
             for kf in fcu.keyframe_points:
@@ -3238,8 +3252,31 @@ def translateOrientationInterpolator(node, action, ancestry, target_node=None, t
             bone_name = target_node.getFieldAsString('name', 'Joint', ancestry)
 
         armature_obj = getattr(target_node, 'blendObject', None) or getattr(real_target, 'blendObject', None)
+        basis_change = Quaternion()
+
         if armature_obj and bone_name in armature_obj.pose.bones:
             armature_obj.pose.bones[bone_name].rotation_mode = 'QUATERNION'
+            bone = armature_obj.data.bones[bone_name]
+
+            # Orientation of the Blender Bone in Armature space
+            r_blender = bone.matrix_local.to_3x3()
+
+            # Orientation of the H-Anim Joint in Armature space
+            cur = bone
+            r_hanim = Matrix.Identity(3)
+            chain = []
+            while cur:
+                chain.append(cur)
+                cur = cur.parent
+            for b in reversed(chain):
+                mat = hanim_x3d.read_rest_local_matrix(b)
+                if mat is not None:
+                    r_hanim = r_hanim @ mat.to_3x3()
+
+            # Change of basis from H-Anim joint frame to Blender bone local frame:
+            # R_bone = M * R_hanim * M^-1, where M = R_blender^-1 * R_hanim
+            m_trans = r_blender.inverted() @ r_hanim
+            basis_change = m_trans.to_quaternion()
 
         rest_rot = target_node.getFieldAsFloatTuple('rotation', (0.0, 0.0, 1.0, 0.0), ancestry)
         rest_axis = Vector(rest_rot[:3])
@@ -3257,12 +3294,18 @@ def translateOrientationInterpolator(node, action, ancestry, target_node=None, t
             ax, ay, az, angle = key_value[i]
             axis = Vector((ax, ay, az))
             quat = Quaternion(axis.normalized(), angle) if axis.length > 1e-6 else Quaternion()
-            delta_quat = quat @ rest_quat.inverted()
+
+            # Relative rotation in H-Anim joint space
+            hanim_delta = quat @ rest_quat.inverted()
+
+            # Map the rotation into the Blender bone's actual local frame
+            bone_delta = basis_change @ hanim_delta @ basis_change.inverted()
+
             frame = start_frame + frac * duration * fps
-            rot_w.keyframe_points.insert(frame, delta_quat.w)
-            rot_x.keyframe_points.insert(frame, delta_quat.x)
-            rot_y.keyframe_points.insert(frame, delta_quat.y)
-            rot_z.keyframe_points.insert(frame, delta_quat.z)
+            rot_w.keyframe_points.insert(frame, bone_delta.w)
+            rot_x.keyframe_points.insert(frame, bone_delta.x)
+            rot_y.keyframe_points.insert(frame, bone_delta.y)
+            rot_z.keyframe_points.insert(frame, bone_delta.z)
 
         for fcu in (rot_w, rot_x, rot_y, rot_z):
             for kf in fcu.keyframe_points:
@@ -3370,9 +3413,6 @@ def translateTimeSensor(node, action, ancestry):
     return
 
 
-# Maps a Blender ID datablock's id_type to the bpy.data collection that
-# holds it, so a tagged Action can be traced back to its target datablock
-# after import without keeping a live Python reference around.
 _ID_TYPE_COLLECTIONS = {
     'OBJECT': 'objects',
     'ARMATURE': 'armatures',
@@ -3382,8 +3422,6 @@ _ID_TYPE_COLLECTIONS = {
 
 
 def _clock_def_name(clock_node, default_clock=None):
-    """Best-effort DEF name for the TimeSensor driving an animation, used to
-    key/tag Actions so distinct clocks never get merged together."""
     ref = clock_node or default_clock
     if ref is not None and hasattr(ref, 'getDefName'):
         try:
@@ -3400,10 +3438,6 @@ def _id_type_name(datablock):
 
 
 def _tag_action_target(action, clock_def, target_datablock=None):
-    """Stamp an Action with the TimeSensor DEF that drives it and (when known)
-    the datablock it is meant to be assigned to, so later UI code (e.g. the
-    X3D animation sidebar) can offer it as a selectable, independently
-    playable entry without re-parsing the source X3D."""
     action["x3d_timesensor"] = clock_def
     if target_datablock is not None:
         action["x3d_target_id_name"] = getattr(target_datablock, "name", "")
@@ -3449,7 +3483,6 @@ def process_all_routes(all_nodes, root_node, bpycollection):
         if from_node and from_node.getSpec() == 'TimeSensor':
             interpolator_clocks[to_id] = from_node
 
-    # Include clocks associated via ProtoInstances (e.g. MenuItem adapter -> Main_Clock)
     mgr = getattr(proto_x3d, 'manager', None)
     adapter_clocks = getattr(mgr, 'adapter_clocks', None) or getattr(proto_x3d, 'adapter_clocks', {})
     for adapter_def, clock_def in adapter_clocks.items():
@@ -3476,7 +3509,6 @@ def process_all_routes(all_nodes, root_node, bpycollection):
         clock = interpolator_clocks.get(from_id, default_clock)
         clock_def = _clock_def_name(clock, default_clock)
 
-        # Identify target datablock (Mesh ShapeKeys, Armature, or Object)
         target_datablock = None
         if to_node is not None:
             real_to_node = to_node.getRealNode() if hasattr(to_node, 'getRealNode') else to_node
@@ -3490,10 +3522,6 @@ def process_all_routes(all_nodes, root_node, bpycollection):
             else:
                 target_datablock = getattr(to_node, 'blendObject', None) or getattr(real_to_node, 'blendObject', None)
 
-        # Key the Action by (target datablock, driving clock) rather than by
-        # target datablock alone, so two distinct TimeSensors animating the
-        # same object (e.g. two alternate pose loops on one armature) end up
-        # as two separately selectable Actions instead of being merged.
         if target_datablock is not None:
             if target_datablock.animation_data is None:
                 target_datablock.animation_data_create()
@@ -3505,7 +3533,6 @@ def process_all_routes(all_nodes, root_node, bpycollection):
             action = getIpo(from_id)
             _tag_action_target(action, clock_def)
 
-        # Translate Interpolators
         from_spec = from_node.getSpec()
         if from_type in {'value_changed', 'fraction_changed'} or from_spec.endswith('Interpolator'):
             if from_spec == 'PositionInterpolator' or to_type in {'set_position', 'set_translation', 'translation', 'position'}:
@@ -3520,7 +3547,6 @@ def process_all_routes(all_nodes, root_node, bpycollection):
         elif from_type == 'bindTime' and to_node:
             translateTimeSensor(to_node, action, ancestry)
 
-        # Ensure slot binding is refreshed now that curves/slots exist
         if target_datablock is not None:
             _bind_action_to_datablock(target_datablock, action)
 
@@ -3599,7 +3625,6 @@ def load_web3d(
         if id(node) in hanim_consumed_ids:
             continue
 
-        # Skip any node inside an HAnimHumanoid subtree; handled by import_humanoid()
         if any(a.getSpec() == 'HAnimHumanoid' for a in ancestry):
             continue
 
@@ -3622,16 +3647,8 @@ def load_web3d(
         elif spec == 'Sound':
             importAudio(bpycollection, node, ancestry, global_matrix)
 
-    # Process all ROUTE, TimeSensor, and Interpolator animations. This is
-    # what tags each resulting Action with the DEF name of the TimeSensor
-    # that drives it (see _tag_action_target), so it must run before the
-    # HAnim sidebar menu is finalized below.
     process_all_routes(all_nodes, root_node, bpycollection)
 
-    # Now that every X3D-driven Action has been created and tagged, fold in
-    # any TimeSensor not already exposed through a MenuItem (e.g. a bare
-    # looping clock driving an armature directly) as its own selectable
-    # entry in the HAnim sidebar menu.
     finalize_fn = getattr(hanim_x3d, "finalize_animation_menu", None)
     if callable(finalize_fn):
         finalize_fn()
@@ -3698,4 +3715,3 @@ def load(context,
                    solidify_value=solidify_value)
 
     return {'FINISHED'}
-
