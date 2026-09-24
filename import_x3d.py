@@ -3370,6 +3370,46 @@ def translateTimeSensor(node, action, ancestry):
     return
 
 
+# Maps a Blender ID datablock's id_type to the bpy.data collection that
+# holds it, so a tagged Action can be traced back to its target datablock
+# after import without keeping a live Python reference around.
+_ID_TYPE_COLLECTIONS = {
+    'OBJECT': 'objects',
+    'ARMATURE': 'armatures',
+    'KEY': 'shape_keys',
+    'MESH': 'meshes',
+}
+
+
+def _clock_def_name(clock_node, default_clock=None):
+    """Best-effort DEF name for the TimeSensor driving an animation, used to
+    key/tag Actions so distinct clocks never get merged together."""
+    ref = clock_node or default_clock
+    if ref is not None and hasattr(ref, 'getDefName'):
+        try:
+            name = ref.getDefName()
+        except Exception:
+            name = None
+        if name:
+            return name
+    return "DefaultClock"
+
+
+def _id_type_name(datablock):
+    return getattr(datablock, "id_type", None) or type(datablock).__name__
+
+
+def _tag_action_target(action, clock_def, target_datablock=None):
+    """Stamp an Action with the TimeSensor DEF that drives it and (when known)
+    the datablock it is meant to be assigned to, so later UI code (e.g. the
+    X3D animation sidebar) can offer it as a selectable, independently
+    playable entry without re-parsing the source X3D."""
+    action["x3d_timesensor"] = clock_def
+    if target_datablock is not None:
+        action["x3d_target_id_name"] = getattr(target_datablock, "name", "")
+        action["x3d_target_id_type"] = _id_type_name(target_datablock)
+
+
 def process_all_routes(all_nodes, root_node, bpycollection):
     routeIpoDict = root_node.getRouteIpoDict()
     defDict = root_node.getDefDict()
@@ -3434,6 +3474,7 @@ def process_all_routes(all_nodes, root_node, bpycollection):
             continue
 
         clock = interpolator_clocks.get(from_id, default_clock)
+        clock_def = _clock_def_name(clock, default_clock)
 
         # Identify target datablock (Mesh ShapeKeys, Armature, or Object)
         target_datablock = None
@@ -3449,18 +3490,20 @@ def process_all_routes(all_nodes, root_node, bpycollection):
             else:
                 target_datablock = getattr(to_node, 'blendObject', None) or getattr(real_to_node, 'blendObject', None)
 
-        # Reuse existing action on target datablock so all curves share one Action
+        # Key the Action by (target datablock, driving clock) rather than by
+        # target datablock alone, so two distinct TimeSensors animating the
+        # same object (e.g. two alternate pose loops on one armature) end up
+        # as two separately selectable Actions instead of being merged.
         if target_datablock is not None:
             if target_datablock.animation_data is None:
                 target_datablock.animation_data_create()
-            if target_datablock.animation_data.action is not None:
-                action = target_datablock.animation_data.action
-            else:
-                action_name = getattr(target_datablock, "name", from_id)
-                action = getIpo(action_name)
-                _bind_action_to_datablock(target_datablock, action)
+            action_name = f"{getattr(target_datablock, 'name', from_id)}_{clock_def}"
+            action = getIpo(action_name)
+            _tag_action_target(action, clock_def, target_datablock)
+            _bind_action_to_datablock(target_datablock, action)
         else:
             action = getIpo(from_id)
+            _tag_action_target(action, clock_def)
 
         # Translate Interpolators
         from_spec = from_node.getSpec()
@@ -3491,6 +3534,8 @@ def process_all_routes(all_nodes, root_node, bpycollection):
                 bpyob = node.blendData = node.blendObject = bpy.data.objects.new('AnimOb', None)
                 bpycollection.objects.link(bpyob)
                 bpyob.select_set(True)
+                if action.get("x3d_timesensor") and not action.get("x3d_target_id_name"):
+                    _tag_action_target(action, action["x3d_timesensor"], bpyob)
                 _bind_action_to_datablock(bpyob, action)
 
 
@@ -3577,8 +3622,19 @@ def load_web3d(
         elif spec == 'Sound':
             importAudio(bpycollection, node, ancestry, global_matrix)
 
-    # Process all ROUTE, TimeSensor, and Interpolator animations
+    # Process all ROUTE, TimeSensor, and Interpolator animations. This is
+    # what tags each resulting Action with the DEF name of the TimeSensor
+    # that drives it (see _tag_action_target), so it must run before the
+    # HAnim sidebar menu is finalized below.
     process_all_routes(all_nodes, root_node, bpycollection)
+
+    # Now that every X3D-driven Action has been created and tagged, fold in
+    # any TimeSensor not already exposed through a MenuItem (e.g. a bare
+    # looping clock driving an armature directly) as its own selectable
+    # entry in the HAnim sidebar menu.
+    finalize_fn = getattr(hanim_x3d, "finalize_animation_menu", None)
+    if callable(finalize_fn):
+        finalize_fn()
 
     if PREF_FLAT is False:
         child_dict = {}

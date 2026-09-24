@@ -410,17 +410,27 @@ def _parse_x3d_numbers(value):
     return [float(v) for v in re.split(r'[\s,]+', value.strip()) if v]
 
 
+def _menu_clock(metadata, menu_id):
+    """DEF name of the TimeSensor a MenuItem's startTime event is routed to,
+    or None if this menu_id isn't wired to a clock at all."""
+    nodes, routes, menus = metadata
+    from_map = {}
+    for a, b, c, d in routes:
+        from_map.setdefault((a, b), []).append((c, d))
+
+    for target, field in from_map.get((menu_id, "startTime"), []):
+        if field == "startTime":
+            return target
+    return None
+
+
 def _menu_animation_graph(metadata, menu_id):
     nodes, routes, menus = metadata
     from_map = {}
     for a, b, c, d in routes:
         from_map.setdefault((a, b), []).append((c, d))
 
-    clock = None
-    for target, field in from_map.get((menu_id, "startTime"), []):
-        if field == "startTime":
-            clock = target
-            break
+    clock = _menu_clock(metadata, menu_id)
     if not clock:
         return {}
 
@@ -447,6 +457,65 @@ def _menu_animation_graph(metadata, menu_id):
                 continue
             result[target] = (keys, values)
     return result
+
+
+# Mirrors import_x3d._ID_TYPE_COLLECTIONS so a tagged Action's
+# x3d_target_id_type/x3d_target_id_name pair can be resolved back to a
+# live datablock without importing import_x3d here.
+_ID_TYPE_COLLECTIONS = {
+    'OBJECT': 'objects',
+    'ARMATURE': 'armatures',
+    'KEY': 'shape_keys',
+    'MESH': 'meshes',
+}
+
+
+def _resolve_tagged_datablock(action):
+    """Look up the datablock an x3d_timesensor-tagged Action was bound to at
+    import time, via the id_type/name it was stamped with."""
+    id_type = action.get("x3d_target_id_type")
+    id_name = action.get("x3d_target_id_name")
+    if not id_type or not id_name:
+        return None
+    coll_name = _ID_TYPE_COLLECTIONS.get(id_type)
+    if not coll_name:
+        return None
+    coll = getattr(bpy.data, coll_name, None)
+    return coll.get(id_name) if coll else None
+
+
+def _prettify_clock_name(def_name):
+    """Fall back label for a standalone TimeSensor with no MenuItem: turn a
+    DEF like 'DefaultTimer' or 'Wave_Clock' into 'Default Timer' / 'Wave Clock'."""
+    text = def_name.replace('_', ' ')
+    text = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', text)     # camelCase boundary
+    text = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', text)   # ...ABCd -> ...AB Cd
+    text = re.sub(r'(?<=[A-Za-z])(?=[0-9])', ' ', text)     # letter -> digit
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text or def_name
+
+
+def _collect_standalone_clocks(used_clock_defs):
+    """Group Actions tagged by process_all_routes (import_x3d.py) by their
+    source TimeSensor DEF, skipping any clock already exposed through a
+    MenuItem entry. One entry per remaining clock becomes a menu item so
+    animations that aren't wired to a MenuItem proto (e.g. a bare looping
+    TimeSensor driving an armature directly) are still selectable from the
+    X3D HAnim Menu sidebar."""
+    by_clock = {}
+    for action in bpy.data.actions:
+        clock_def = action.get("x3d_timesensor")
+        if not clock_def or clock_def in used_clock_defs:
+            continue
+        by_clock.setdefault(clock_def, []).append(action)
+
+    items = []
+    for clock_def in by_clock:
+        items.append({
+            "id": clock_def,
+            "description": _prettify_clock_name(clock_def),
+        })
+    return items
 
 
 def _register_animation_ui():
@@ -477,15 +546,23 @@ def _register_animation_ui():
         def draw(self, context):
             layout = self.layout
             items = []
-            for sk in bpy.data.shape_keys:
-                raw = sk.get("hanim_menu_items")
-                if raw:
-                    try:
-                        items = json.loads(raw)
-                    except Exception:
-                        pass
-                    if items:
-                        break
+            raw = context.scene.get("hanim_menu_items")
+            if raw:
+                try:
+                    items = json.loads(raw)
+                except Exception:
+                    items = []
+            if not items:
+                # Back-compat: older imports stored the list per shape key.
+                for sk in bpy.data.shape_keys:
+                    raw = sk.get("hanim_menu_items")
+                    if raw:
+                        try:
+                            items = json.loads(raw)
+                        except Exception:
+                            pass
+                        if items:
+                            break
             if not items:
                 layout.label(text="No X3D MenuItems found")
                 return
@@ -505,8 +582,25 @@ def _register_animation_ui():
             pass
 
 
+def _assign_action(datablock, action):
+    if datablock is None or action is None:
+        return
+    datablock.animation_data_create()
+    datablock.animation_data.action = action
+    # In Blender 5.x, explicitly select the compatible slot when one is
+    # available. This avoids an Action being assigned but not actually
+    # driving the target data-block.
+    try:
+        suitable = datablock.animation_data.action_suitable_slots
+        if suitable:
+            datablock.animation_data.action_slot = suitable[0]
+    except (AttributeError, RuntimeError):
+        pass
+
+
 def _activate_hanim_menu(menu_id):
     scene = bpy.context.scene
+
     # Reset all imported facial shape keys before installing the selected action.
     for sk in bpy.data.shape_keys:
         if sk.get("hanim_menu_items"):
@@ -515,10 +609,22 @@ def _activate_hanim_menu(menu_id):
             for kb in sk.key_blocks:
                 kb.value = 0.0
 
+    # Reset every datablock currently driven by an X3D-tagged Action
+    # (armatures, objects, and any shape keys not already covered above),
+    # so switching entries never leaves a previous clock's pose applied.
+    for action in bpy.data.actions:
+        if not action.get("x3d_timesensor"):
+            continue
+        target = _resolve_tagged_datablock(action)
+        if target is not None and target.animation_data and target.animation_data.action is action:
+            target.animation_data.action = None
+
     if menu_id == "Reset":
         scene.hanim_x3d_active_menu = "Reset"
         return
 
+    # Path 1: MenuItem-driven facial shape-key actions (existing mechanism).
+    matched = False
     for sk in bpy.data.shape_keys:
         raw = sk.get("hanim_menu_actions")
         if not raw:
@@ -531,17 +637,19 @@ def _activate_hanim_menu(menu_id):
         if action_name:
             action = bpy.data.actions.get(action_name)
             if action:
-                sk.animation_data_create()
-                sk.animation_data.action = action
-                # In Blender 5.x, explicitly select the compatible slot when
-                # one is available.  This avoids an Action being assigned but
-                # not actually driving the Shape Keys data-block.
-                try:
-                    suitable = sk.animation_data.action_suitable_slots
-                    if suitable:
-                        sk.animation_data.action_slot = suitable[0]
-                except (AttributeError, RuntimeError):
-                    pass
+                _assign_action(sk, action)
+                matched = True
+
+    # Path 2: standalone TimeSensors (no MenuItem) tagged directly on their
+    # Actions by process_all_routes. Covers armatures/objects as well as any
+    # shape keys not reached via Path 1.
+    if not matched:
+        for action in bpy.data.actions:
+            if action.get("x3d_timesensor") != menu_id:
+                continue
+            target = _resolve_tagged_datablock(action)
+            if target is not None:
+                _assign_action(target, action)
 
     scene.hanim_x3d_active_menu = menu_id
 
@@ -574,76 +682,126 @@ def _build_hanim_animation_actions(humanoid_node):
             if def_name:
                 displacer_map[def_name] = (sk, key_name)
 
-    if not displacer_map:
-        return
-
-    # Build actions independently on every Shape Keys datablock.
-    for sk in bpy.data.shape_keys:
-        relevant = {d: v for d, v in displacer_map.items() if v[0] == sk}
-        if not relevant:
-            continue
-
-        action_names = {}
-        for menu_id, menu in menu_map.items():
-            if menu_id == "Reset":
-                continue
-            graph = _menu_animation_graph(metadata, menu_id)
-            if not graph:
+    # Build actions independently on every Shape Keys datablock. Skipped
+    # entirely for files with no facial displacers (e.g. skeleton-only
+    # rigs) -- those still get standalone-clock entries below.
+    if displacer_map:
+        for sk in bpy.data.shape_keys:
+            relevant = {d: v for d, v in displacer_map.items() if v[0] == sk}
+            if not relevant:
                 continue
 
-            targets = [(def_name, key_name, graph[def_name])
-                       for def_name, (_, key_name) in relevant.items()
-                       if def_name in graph]
-            if not targets:
-                continue
+            action_names = {}
+            for menu_id, menu in menu_map.items():
+                if menu_id == "Reset":
+                    continue
+                graph = _menu_animation_graph(metadata, menu_id)
+                if not graph:
+                    continue
 
-            action = bpy.data.actions.new(
-                f"X3D_{menu_id}_{sk.name}"
-            )
-            action["hanim_menu_id"] = menu_id
-            action["hanim_source"] = filename or ""
+                targets = [(def_name, key_name, graph[def_name])
+                           for def_name, (_, key_name) in relevant.items()
+                           if def_name in graph]
+                if not targets:
+                    continue
 
-            # Blender 5.x requires the Action to be assigned to the ID before
-            # fcurve_ensure_for_datablock() can create its channel.
-            sk.animation_data_create()
-            sk.animation_data.action = action
-
-            for _, key_name, (keys, values) in targets:
-                # Blender 5.x uses slotted Actions.  The old
-                # action.fcurves API was removed in Blender 5.0.
-                # fcurve_ensure_for_datablock() creates the appropriate
-                # slot/layer/strip/channelbag for this Shape Keys ID.
-                fcurve = action.fcurve_ensure_for_datablock(
-                    sk,
-                    data_path=f'key_blocks["{key_name}"].value',
-                    index=0,
+                action = bpy.data.actions.new(
+                    f"X3D_{menu_id}_{sk.name}"
                 )
-                for key, value in zip(keys, values):
-                    frame = 1.0 + float(key) * 29.0
-                    fcurve.keyframe_points.insert(frame, float(value), options={'FAST'})
-                fcurve.update()
-                # Blender 5.x exposes only CONSTANT/LINEAR as FCurve
-                # extrapolation modes.  Cyclic playback is represented by a
-                # Cycles F-Modifier instead.
-                if not any(mod.type == 'CYCLES' for mod in fcurve.modifiers):
-                    fcurve.modifiers.new(type='CYCLES')
+                action["hanim_menu_id"] = menu_id
+                action["hanim_source"] = filename or ""
 
-            action_names[menu_id] = action.name
+                # Blender 5.x requires the Action to be assigned to the ID before
+                # fcurve_ensure_for_datablock() can create its channel.
+                sk.animation_data_create()
+                sk.animation_data.action = action
 
-        # The imported model should start unanimated; the sidebar operator
-        # assigns whichever MenuItem the user selects.
-        if sk.animation_data:
-            sk.animation_data.action = None
+                for _, key_name, (keys, values) in targets:
+                    # Blender 5.x uses slotted Actions.  The old
+                    # action.fcurves API was removed in Blender 5.0.
+                    # fcurve_ensure_for_datablock() creates the appropriate
+                    # slot/layer/strip/channelbag for this Shape Keys ID.
+                    fcurve = action.fcurve_ensure_for_datablock(
+                        sk,
+                        data_path=f'key_blocks["{key_name}"].value',
+                        index=0,
+                    )
+                    for key, value in zip(keys, values):
+                        frame = 1.0 + float(key) * 29.0
+                        fcurve.keyframe_points.insert(frame, float(value), options={'FAST'})
+                    fcurve.update()
+                    # Blender 5.x exposes only CONSTANT/LINEAR as FCurve
+                    # extrapolation modes.  Cyclic playback is represented by a
+                    # Cycles F-Modifier instead.
+                    if not any(mod.type == 'CYCLES' for mod in fcurve.modifiers):
+                        fcurve.modifiers.new(type='CYCLES')
 
-        if action_names:
-            sk["hanim_menu_actions"] = json.dumps(action_names)
-            sk["hanim_menu_items"] = json.dumps(
-                [m for m in menus],
-                separators=(",", ":")
-            )
+                action_names[menu_id] = action.name
+
+            # The imported model should start unanimated; the sidebar operator
+            # assigns whichever MenuItem the user selects.
+            if sk.animation_data:
+                sk.animation_data.action = None
+
+            if action_names:
+                sk["hanim_menu_actions"] = json.dumps(action_names)
+                sk["hanim_menu_items"] = json.dumps(
+                    [m for m in menus],
+                    separators=(",", ":")
+                )
+
+    # Actual UI registration (including any standalone, non-MenuItem
+    # TimeSensors) happens once per file in finalize_animation_menu(), after
+    # import_x3d.process_all_routes() has tagged every X3D-driven Action --
+    # that tagging is what standalone-clock discovery depends on, and it
+    # runs after this function during import.
+    _pending_menu_metadata.append(metadata)
+    print("HAnim X3D: found", len(menu_map), "MenuItem(s) for", filename or humanoid_node)
+
+
+# Accumulates (nodes, routes, menus) metadata across every HAnimHumanoid
+# processed during the current import, so finalize_animation_menu() can
+# compute the full set of MenuItem-covered clocks even when a scene has
+# more than one humanoid.
+_pending_menu_metadata = []
+
+
+def finalize_animation_menu():
+    """Call once per file import, after import_x3d.process_all_routes() has
+    tagged every X3D-driven Action with its source TimeSensor DEF. Merges
+    MenuItem entries (collected earlier by _build_hanim_animation_actions)
+    with one entry per standalone TimeSensor not already covered by a
+    MenuItem, and installs the combined list as the HAnim sidebar menu."""
+    global _pending_menu_metadata
+
+    all_menus = []
+    used_clock_defs = set()
+    for metadata in _pending_menu_metadata:
+        _, _, menus = metadata
+        all_menus.extend(menus)
+        for menu in menus:
+            menu_id = menu.get("id")
+            if not menu_id or menu_id == "Reset":
+                continue
+            clock = _menu_clock(metadata, menu_id)
+            if clock:
+                used_clock_defs.add(clock)
+
+    standalone_items = _collect_standalone_clocks(used_clock_defs)
+    combined_items = all_menus + standalone_items
+
+    if combined_items:
+        bpy.context.scene["hanim_menu_items"] = json.dumps(
+            combined_items, separators=(",", ":")
+        )
 
     _register_animation_ui()
-    print("HAnim X3D: installed", len(menus), "MenuItems as Blender animation controls.")
+    print(
+        "HAnim X3D: installed", len(all_menus), "MenuItem(s) and",
+        len(standalone_items), "standalone TimeSensor(s) as Blender animation controls."
+    )
+
+    _pending_menu_metadata = []
 
 
 # ---------------------------------------------------------------------------
