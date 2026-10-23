@@ -15,6 +15,8 @@ Or headless from a shell:
 import os
 import sys
 
+from mathutils import Quaternion
+
 import addon_utils
 import bpy
 
@@ -86,6 +88,14 @@ def load(filepath, clear=True, axis_forward="Y", axis_up="Z"):
     )
     if "FINISHED" not in result:
         raise RuntimeError(f"Import did not finish: {result}")
+
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type == 'VIEW_3D':
+                space_3d = area.spaces[0]
+                rv3d = space_3d.region_3d
+                rv3d.view_rotation = Quaternion((1.0, 0.0, 0.0, 0.0))
+                rv3d.update()
 
     return [obj for obj in bpy.data.objects if obj not in before]
 
