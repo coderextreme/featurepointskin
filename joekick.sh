@@ -1,1 +1,2 @@
+# ball doesn't move into air from ground
 /home/yottzumm/Downloads/blender-5.2.2-linux-x64/blender --python load.py -- JoeKickAnimation.x3d
