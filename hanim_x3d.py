@@ -11,6 +11,8 @@ Design decisions baked into this module:
   3. HAnimJoint.scaleOrientation is baked into the bone's rest-pose matrix on import.
   4. HAnimSegment own-geometry walks Transform hierarchies, baking cumulative matrices.
   5. HAnimDisplacer nodes import as Blender Shape Keys with coordinate displacements.
+
+TODO: export tests
 """
 
 import json
